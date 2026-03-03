@@ -1,0 +1,70 @@
+[server]
+host = "localhost"
+port = 8070
+cookie_domain = ".vayload.me"
+origins = [
+    "http://localhost:3000",
+    "http://localhost:4321",
+    "http://localhost:8080",
+    "http://localhost:4322",
+    "http://localhost:8050",
+    "http://localhost:8060",
+    "https://plugins.vayload.me",
+    "https://plugins.vayload.dev",
+]
+trusted_proxies = [
+	"0.0.0.0/0"
+]
+log_level = "debug"
+
+[security]
+jwt_public_key = ""
+jwt_private_key = ""
+jwt_expiration_time = 15
+jwt_refresh_expiration_days = 15
+
+[database]
+url = "./data/vayload_registry.db"
+token = ""
+
+[oauth.github_web]
+client_id = ""
+client_secret = ""
+redirect_url = "https://registry.vayload.me/v1/auth/oauth/github/callback"
+
+[oauth.github_cli]
+client_id = ""
+client_secret = ""
+redirect_url = "http://localhost:53682/callback"
+
+[oauth.google_web]
+client_id = ""
+client_secret = ""
+redirect_url = "https://registry.vayload.me/v1/auth/oauth/google/callback"
+
+[oauth.google_cli]
+client_id = ""
+client_secret = ""
+redirect_url = "http://localhost:53682/callback"
+
+[storage]
+bucket_name = "vayload-registry"
+local_dir = "./storage"
+local_secret = ""
+local_endpoint = ""
+# R2 storage credentials
+r2_endpoint = ""
+r2_secret_key = ""
+r2_access_key = ""
+r2_token = ""
+
+[cache]
+addr = ""
+password = ""
+db = 1
+namespace = "vayload.registry"
+
+[email]
+api_key = ""
+email_from = ""
+app_base_url = ""
