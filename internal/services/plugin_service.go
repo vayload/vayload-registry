@@ -2,33 +2,25 @@ package services
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"time"
 
 	"github.com/vayload/plug-registry/internal/domain"
-	"github.com/vayload/plug-registry/pkg/ids"
+	"github.com/vayload/plug-registry/internal/services/packager"
+	unitofwork "github.com/vayload/plug-registry/internal/services/unit-of-work"
+	"github.com/vayload/plug-registry/internal/shared"
+	"github.com/vayload/plug-registry/internal/shared/errors"
+	"github.com/vayload/plug-registry/internal/shared/identity"
+	"github.com/vayload/plug-registry/pkg/optional"
 )
 
-type IPackageResult struct {
-	Reader   io.Reader      // El .tar.gz normalizado
-	Metadata PluginMetadata // Datos del plugin.json
-	Manifest string         // Raw JSON
-	Readme   *string        // Contenido README
-	License  *string        // Contenido LICENSE
-	Checksum func() string  // SHA256 final (se llama tras consumir el Reader)
-}
-
 type IPluginPackager interface {
-	// Procesa ZIP/TAR, extrae metadata y normaliza a Stream TarGz
-	Package(ctx context.Context, r io.Reader, size int64) (*IPackageResult, error)
-}
-
-type IPluginStorage interface {
-	Put(ctx context.Context, key string, r io.Reader) error
-	Get(ctx context.Context, key string) (io.ReadCloser, error)
-	GetSignedURL(ctx context.Context, key string) (string, error)
-	Delete(ctx context.Context, key string) error
+	Package(ctx context.Context, file *shared.File) (*packager.PackageResult, error)
 }
 
 type PublishOptions struct {
@@ -36,19 +28,55 @@ type PublishOptions struct {
 	IsDraft bool
 }
 
+// A background worker periodically checks for pending publish_tasks.
+//
+//	If it detects that:
+//	   - The plugin/version exists in storage but not fully reflected in the database,
+//	it reconciles the state by:
+//	   - Updating the publish_task to "completed"
+//	   - Marking the plugin as "published".
+
 type IPluginService interface {
 	// POST /plugins/publish
-	// Publis funciona asi; llega el file reader, le pasamos al Packager para que normalize, valide el paquete pasando de zip a tar.gz y extreyendo toda la metadata necesaria
-	// Deemos revizar si el userid es dueño, o la api token que viene en el header es valida y pertenece al usuario
-	// Si el plugin no existe, se crea
-	// Si el plugin existe, se asigna una nueva version, para esto tenemos que revizar que el plugin no tenga esa version en base de datos.
-	// Si el plugin existe y tiene la version, se debe rechazar la peticion
-	// Si el plugin existe y no tiene la version, se debe crear la version
-	// // registramos un log en base de datos en la tabla publish_tasks y guardamos la metadata del plugin con estado pending
-	// Subimos el archivo a r2 con el nombre {plugin_name}/{version}.tar.gz en el bucket vr-plugins o en local storage
-	// privado o publico se suben a r2, y cuando el plugin subio de forma exitosa, se pasa el plugin_task a completed y plugin published, a menos que por query param explicitamente el developer haya dicho que es draft, porque esta en desarrollo, ni beta
-	// Se crea el plugin si no existe, y tambien se crea la nueva version, en este punto estamos seguros de que el plugin existe o no, y la version es nueva. en un transaction, si falla algo se revierte todo. pero plugin_tasks queda en pending, es un caso muy raro por eso hay un worker que se encargar de revizar los task no completados y revizar si no esta en la base de datos y pero el plugin si se subio, entonces se actualiza el plugin_task a completed y plugin published
-	Publish(ctx context.Context, userID string, file io.ReadSeeker, size int64, options PublishOptions) (*domain.Plugin, error)
+	// Publish workflow:
+	// 1. The request receives a file reader.
+	// 2. The file is passed to the Packager, which:
+	//    - Normalizes the package.
+	//    - Validates its structure.
+	//    - Converts it from .zip to .tar.gz.
+	//    - Extracts all required metadata.
+	//
+	// 3. Authorization is verified:
+	//    - Ensure the user ID is the owner, OR
+	//    - Validate that the API token provided in the header is valid and belongs to the user.
+	//
+	// 4. If the plugin does not exist, it is created.
+	//
+	// 5. If the plugin exists:
+	//    - Check whether the provided version already exists in the database.
+	//    - If the version already exists, reject the request.
+	//    - If the version does not exist, create a new version entry.
+	//
+	// 6. A publish task record is inserted into the database (publish_tasks table)
+	//    with status "pending", including all relevant plugin metadata.
+	//
+	// 7. The packaged file is uploaded to R2 (or local storage) using the path:
+	//       {plugin_name}/{version}.tar.gz
+	//    inside the "vr-plugins" bucket.
+	//
+	// 8. Both public and private plugins are uploaded to R2.
+	//
+	// 9. After a successful upload:
+	//    - The publish_task status is updated to "completed".
+	//    - The plugin status is set to "published",
+	//      unless the developer explicitly specifies via query parameter that
+	//      the release is a draft (e.g., still in development, not beta).
+	//
+	// 10. The plugin creation and version creation occur inside a database transaction.
+	//     If any step fails, the transaction is rolled back.
+	//     However, the publish_task may remain in "pending" state.
+	//
+	Publish(ctx context.Context, userID string, file *shared.File, options PublishOptions) (*domain.Plugin, error)
 
 	// GET /plugins
 	Search(ctx context.Context, filter domain.PluginFilter) ([]domain.Plugin, error)
@@ -60,185 +88,211 @@ type IPluginService interface {
 	GetDetail(ctx context.Context, name string) (*domain.Plugin, error)
 
 	// GET /plugins/{name}/download
-	//  Responde con un redirect al la url firmada 5 minutos, si el plugin es publico, si es privado, debe estar autenticado y autorizado
-	// si el plugin no existe, se debe rechazar la peticion
-	// si el plugin existe y no tiene la version, se debe rechazar la peticion, sila version no se especifica, se trae la ultima stable
 	GetDownloadURL(ctx context.Context, name string, version *string) (string, error)
 
-	// PATCH /plugins/{name}/{version}/status
-	// actualiza el estado del plugin, solo el dueño puede hacerlo, o tiene reglas de transition
-	/**
-		 pub fn can_transition_to(&self, next: PluginStatus) -> bool {
-	        match (self, next) {
-	            (PluginStatus::Draft, PluginStatus::Published) => true,
-	            (PluginStatus::Published, PluginStatus::Deprecated) => true,
-	            (PluginStatus::Published, PluginStatus::Archived) => true,
-	            (PluginStatus::Deprecated, PluginStatus::Archived) => true,
-	            (_, PluginStatus::Yanked) => true,
-	            (a, b) => a.eq(&b),
-	        }
-	    }
-		**/
 	UpdateStatus(ctx context.Context, userID, name, version, status string) error
 	DeleteVersion(ctx context.Context, userID, name, version string) error
 }
 
-const (
-	LimitFreeBytes       = 10 * 1024 * 1024 // 10 MB
-	MaxFiles             = 200
-	MaxSingleFileSize    = 5 * 1024 * 1024   // 5 MB
-	MaxUncompressedTotal = 100 * 1024 * 1024 // 100 MB
-)
-
-type PluginMetadata struct {
-	Name        string  `json:"name"`
-	DisplayName string  `json:"display_name"`
-	Namespace   string  `json:"namespace"` // user for isolate plugins
-	Version     string  `json:"version"`
-	Description *string `json:"description"`
-	License     *string `json:"license"` // The license of the plugin (MIT, Apache 2.0, etc)
-	Homepage    *string `json:"homepage"`
-	Repository  *string `json:"repository"`
-	Access      *string `json:"access"` // public, private // get from query params
-}
-
-type Extracted struct {
-	Manifest string
-	Readme   *string
-	License  *string
-}
-
-// PluginService provides methods for managing plugins, including publication,
-// search, and status updates. It coordinates between the repository,
-// storage, and packager.
 type PluginService struct {
 	repository domain.PluginRepository
-	storage    domain.StorageProvider
+	objects    domain.ObjectRepository
+	storage    domain.IPluginStorage
 	packager   IPluginPackager
+	uow        *unitofwork.UnitOfWork
 }
 
-func NewPluginService(repository domain.PluginRepository, storage domain.StorageProvider) *PluginService {
+func NewPluginService(repository domain.PluginRepository, objects domain.ObjectRepository, storage domain.IPluginStorage, packager IPluginPackager, uow *unitofwork.UnitOfWork) *PluginService {
 	return &PluginService{
 		repository: repository,
+		objects:    objects,
 		storage:    storage,
-		packager:   NewDefaultPackager(),
+		packager:   packager,
+		uow:        uow,
 	}
 }
 
-func (s *PluginService) Publish(ctx context.Context, userID string, file io.ReadSeeker, size int64, options PublishOptions) (*domain.Plugin, error) {
-	if size > LimitFreeBytes {
-		return nil, domain.NewValidationError("Upload too large")
-	}
+type PublishInput struct {
+	UserID  string
+	Scope   string
+	Reader  io.ReadSeekCloser
+	Size    int64
+	Options PublishOptions
+}
 
-	res, err := s.packager.Package(ctx, file, size)
+func (s *PluginService) Publish(ctx context.Context, userID domain.UserID, file *shared.File, options PublishOptions, scope *domain.KeyScope) (*domain.Plugin, error) {
+	// !TODO: If first time is best idea read only name and version for first check
+	pluginPackage, err := s.packager.Package(ctx, file)
 	if err != nil {
 		return nil, err
 	}
 
-	name, err := domain.NewPluginName(res.Metadata.Name)
+	name, err := domain.NewPluginName(pluginPackage.Metadata.Name)
 	if err != nil {
 		return nil, err
 	}
 
-	// 2. Revisar si el plugin existe y el usuario es dueño
-	plugin, err := s.repository.GetByName(ctx, name)
-	if err != nil {
+	plugin, err := s.repository.FindPluginSummary(ctx, *domain.NewPluginFindBy().WithName(name.String()))
+	if err != nil && !errors.Is(err, domain.ErrNotResultSet) {
+		// Reject any errors if is not
 		return nil, err
 	}
 
-	isNew := false
-	if plugin == nil {
-		isNew = true
-		plugin = domain.NewPlugin(
-			domain.PluginId(ids.New().String()),
-			name,
-			domain.PluginOwner{ID: userID},
-			res.Metadata.Description,
-			res.Metadata.Homepage,
-			res.Metadata.Repository,
-			nil,
-			res.Readme,
-			res.License,
-			domain.PluginVisibilityPublic,
-			nil,
-		)
-		if options.Access == "private" {
-			plugin.Visibility = domain.PluginVisibilityPrivate
-		}
-	} else {
-		if plugin.Owner.ID != userID {
-			return nil, domain.NewUnauthorizedError("You are not the owner of this plugin")
+	var pluginID *string
+	if plugin != nil {
+		id := plugin.ID.String()
+		pluginID = &id
+	}
+	if canPerms := scope.HasScope(domain.ScopeReadWrite, pluginID); !canPerms {
+		return nil, errors.Unauthorized("You are not authorized to publish this plugin")
+	}
+
+	// Checking is plugin publicable
+	if plugin != nil {
+		if plugin.Owner.ID != userID.String() {
+			return nil, errors.Unauthorized("You are not the owner of this plugin")
 		}
 
-		// 3. Revisar si la versión ya existe
-		exists, err := s.repository.HasVersionUploaded(ctx, name, res.Metadata.Version)
+		// Check if version already exists
+		filters := domain.NewPluginFindBy().WithName(plugin.Name.String()).WithVersion(pluginPackage.Metadata.Version)
+		exists, err := s.repository.HasMatchingPlugin(ctx, *filters)
 		if err != nil {
 			return nil, err
 		}
 		if exists {
-			return nil, domain.NewAlreadyExistsError(fmt.Sprintf("Version %s already exists", res.Metadata.Version))
+			return nil, errors.AlreadyExists(fmt.Sprintf("Version %s already exists", pluginPackage.Metadata.Version))
 		}
 	}
 
-	// 4. Crear PluginTask en pending
-	taskID := ids.New().String()
-	task := domain.PluginTask{
-		ID:        taskID,
-		PluginID:  plugin.ID,
-		Version:   res.Metadata.Version,
-		UserID:    userID,
-		Status:    domain.PluginTaskStatusPending,
-		Metadata:  res.Manifest,
-		CreatedAt: time.Now().UTC(),
-		UpdatedAt: time.Now().UTC(),
+	isNew := plugin == nil
+	if plugin == nil {
+		respository := optional.Map(optional.OfPtr(pluginPackage.Metadata.Repository), func(s domain.Repository) *string {
+			return &s.URL
+		}).OrElse(nil)
+
+		plugin = domain.NewPlugin(
+			domain.PluginId(identity.MustNew().String()),
+			name,
+			domain.PluginOwner{ID: userID.String()},
+			&pluginPackage.Metadata.Description,
+			pluginPackage.Metadata.Homepage,
+			respository,
+			nil,
+			domain.PluginVisibilityPublic,
+			[]string{},
+		)
+		if options.Access == "private" {
+			plugin.Visibility = domain.PluginVisibilityPrivate
+		}
+
+		// When developer publish a plugin, without IsDraft option, we need to update the latest versions for fast find stable, beta versions
+		if !options.IsDraft {
+			plugin.Status = domain.PluginStatusPublished
+		}
 	}
 
-	if err := s.repository.CreateTask(ctx, task); err != nil {
-		return nil, err
-	}
-
-	// 5. Iniciar publicación (idealmente en una transacción si la DB lo soporta para plugin + version)
-	// Pero el storage es externo.
-
-	// Subimos el archivo
-	_, filesize, sha256Hex, err := s.storage.Upload(ctx, name.String(), res.Metadata.Version, res.Reader)
+	// Once the plugin package has been validated and confirmed to be in a correct format,
+	// we proceed with the publication process.
+	//
+	// This is currently handled synchronously, but the logic is isolated so it can be
+	// moved to a background worker in the future to support asynchronous processing
+	// and large-scale concurrent uploads.
+	plugin, err = s.processPublish(ctx, plugin, pluginPackage, file, options, isNew)
 	if err != nil {
-		_ = s.repository.UpdateTaskStatus(ctx, taskID, domain.PluginTaskStatusFailed, ptr(err.Error()))
 		return nil, err
 	}
 
-	if isNew {
-		if _, err := s.repository.Create(ctx, *plugin); err != nil {
-			return nil, err
-		}
+	return plugin, nil
+}
+
+type MetadataBlobs struct {
+	Manifest *domain.BlobObject
+	Readme   *domain.BlobObject
+	License  *domain.BlobObject
+}
+
+func createMetadataBlobs(pluginPackage *packager.PackageResult) (MetadataBlobs, []domain.BlobObject) {
+	meta := MetadataBlobs{}
+
+	blobs := make([]domain.BlobObject, 3)
+
+	blob := []byte(pluginPackage.Manifest)
+	hash := calcSHA256(blob)
+	meta.Manifest = domain.NewBlobObject(hash, "manifest", "application/json", blob)
+	blobs[0] = *meta.Manifest
+
+	if pluginPackage.Readme != nil {
+		blob := []byte(*pluginPackage.Readme)
+		hash := calcSHA256(blob)
+		meta.Readme = domain.NewBlobObject(hash, "readme", "text/markdown", blob)
+		blobs[1] = *meta.Readme
 	}
 
-	// Crear versión
-	version := domain.NewPluginVersion(
-		ids.New().String(),
-		plugin.ID,
-		res.Metadata.Version,
-		res.Manifest,
-		"sha256-"+sha256Hex,
-		fmt.Sprintf("%s-%s.tar.gz", name, res.Metadata.Version),
-		uint64(filesize),
-		0, // count files... if we had it
-		nil, nil, nil,
-	)
+	if pluginPackage.License != nil {
+		blob := []byte(*pluginPackage.License)
+		hash := calcSHA256(blob)
+		meta.License = domain.NewBlobObject(hash, "license", "text/plain", blob)
+		blobs[2] = *meta.License
+	}
 
-	if _, err := s.repository.CreateVersion(ctx, version); err != nil {
+	return meta, blobs
+}
+
+func calcSHA256(data []byte) string {
+	h := sha256.New()
+	h.Write(data)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func (s *PluginService) processPublish(ctx context.Context, plugin *domain.Plugin, pluginPackage *packager.PackageResult, file *shared.File, options PublishOptions, isNew bool) (*domain.Plugin, error) {
+	storageKey := fmt.Sprintf("%s/%s.tar.gz", plugin.Name.String(), pluginPackage.Metadata.Version)
+	if err := s.storage.Put(ctx, storageKey, "application/gzip", pluginPackage.Reader); err != nil {
 		return nil, err
 	}
 
-	// Actualizar latest versions
-	if !options.IsDraft {
-		if err := s.repository.UpdateLatestVersions(ctx, plugin.ID, res.Metadata.Version); err != nil {
-			return nil, err
+	err := s.uow.Do(ctx, func(ctx context.Context, repos *unitofwork.RepositoryProvider) error {
+		meta, blobs := createMetadataBlobs(pluginPackage)
+		if err := repos.Objects.UpsertObjects(ctx, blobs); err != nil {
+			return err
 		}
-	}
 
-	// 6. Marcar task como completado
-	if err := s.repository.UpdateTaskStatus(ctx, taskID, domain.PluginTaskStatusCompleted, nil); err != nil {
+		if isNew {
+			if _, err := repos.Plugins.CreatePlugin(ctx, *plugin); err != nil {
+				return err
+			}
+		}
+
+		version := domain.NewPluginVersion(
+			identity.MustNew().String(),
+			plugin.ID,
+			pluginPackage.Metadata.Version,
+			pluginPackage.Checksum(),
+			storageKey,
+			uint64(file.Size),
+			int32(pluginPackage.FileCount),
+		)
+
+		version.ManifestObject = meta.Manifest.ObjectHash
+		version.ReadmeObject = &meta.Readme.ObjectHash
+		version.LicenseObject = &meta.License.ObjectHash
+
+		if _, err := repos.Plugins.CreateVersion(ctx, version); err != nil {
+			return err
+		}
+
+		// When user publish a plugin, we need to update the latest versions for fast find stable, beta versions
+		if !options.IsDraft {
+			if err := repos.Plugins.UpdateLatestVersions(ctx, plugin.ID, pluginPackage.Metadata.Version); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		// Try to delete the uploaded file, because we failed to create the plugin
+		_ = s.storage.Delete(ctx, storageKey)
 		return nil, err
 	}
 
@@ -258,37 +312,110 @@ func (s *PluginService) GetDetail(ctx context.Context, name string) (*domain.Plu
 	if err != nil {
 		return nil, err
 	}
-	return s.repository.GetByName(ctx, pName)
+	return s.repository.FindPluginSummary(ctx, *domain.NewPluginFindBy().WithName(pName.String()))
 }
 
-func (s *PluginService) GetDownloadURL(ctx context.Context, name string, version *string) (string, error) {
+func (s *PluginService) GetPluginSummary(ctx context.Context, name string) (*domain.Plugin, error) {
 	pName, err := domain.NewPluginName(name)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	plugin, err := s.repository.GetByName(ctx, pName)
+	plugin, err := s.repository.FindPluginSummary(ctx, *domain.NewPluginFindBy().WithName(pName.String()))
+	if err != nil {
+		return nil, err
+	}
+	if plugin == nil {
+		return nil, errors.NotFound("Plugin not exists")
+	}
+
+	return plugin, nil
+}
+
+type PackageMeta struct {
+	ID            string       `json:"id"`
+	Name          string       `json:"name"`
+	Version       string       `json:"version"`
+	LatestVersion string       `json:"latest_version"`
+	Artifact      ArtifactMeta `json:"artifact"`
+}
+
+type ArtifactMeta struct {
+	URL       string `json:"url"`
+	ExpiresAt int64  `json:"expires_at"`
+	Size      int64  `json:"size_bytes"`
+	Integrity string `json:"integrity"`
+	Algorithm string `json:"algorithm"`
+}
+
+func (s *PluginService) GetDownloadURL(ctx context.Context, name string, version *string) (*PackageMeta, error) {
+	pName, err := domain.NewPluginName(name)
+	if err != nil {
+		return nil, err
+	}
+
+	filter := domain.NewPluginFindBy().WithName(pName.String())
+	plugin, err := s.repository.FindPluginSummary(ctx, *filter)
 	if err != nil || plugin == nil {
-		return "", domain.NewNotFoundError("Plugin not found")
+		return nil, errors.NotFound("plugin not found").Cause(err)
 	}
 
-	v := ""
-	if version == nil {
-		if plugin.LatestStableVersion == nil {
-			return "", domain.NewNotFoundError("No stable version available")
+	targetVersion := ""
+	if safeString(version) != "" {
+		targetVersion = *version
+	} else if plugin.LatestStableVersion != nil {
+		targetVersion = *plugin.LatestStableVersion
+	}
+
+	if targetVersion == "" {
+		return nil, errors.NotFound("no stable version available")
+	}
+
+	ver, err := s.repository.GetVersion(ctx, plugin.ID, targetVersion)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotResultSet) {
+			return nil, errors.NotFound("version not found")
 		}
-		v = *plugin.LatestStableVersion
-	} else {
-		v = *version
+
+		return nil, errors.Internal("failed to get version").Cause(err)
 	}
 
-	// Check if version exists
-	ver, err := s.repository.GetVersion(ctx, plugin.ID, v)
-	if err != nil || ver == nil {
-		return "", domain.NewNotFoundError("Version not found")
+	downloadURL, err := s.storage.GetSignedURL(ctx, ver.Filename)
+	if err != nil {
+		return nil, errors.Internal("failed to generate download link").Cause(err)
 	}
 
-	return s.storage.GetSignedURL(ctx, ver.Filename)
+	// Update total downloads in background
+	go func(pID domain.PluginId, v string) {
+		updateCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := s.repository.UpdateDownloads(updateCtx, pID, v, 1); err != nil {
+			log.Printf("async error: failed to update downloads for %s@%s: %v", pID, v, err)
+		}
+	}(plugin.ID, ver.Version)
+
+	integrity := base64.RawURLEncoding.EncodeToString(ver.Integrity[:])
+	return &PackageMeta{
+		ID:            plugin.ID.String(),
+		Name:          plugin.Name.String(),
+		Version:       ver.Version,
+		LatestVersion: safeString(plugin.LatestStableVersion),
+		Artifact: ArtifactMeta{
+			URL:       downloadURL,
+			ExpiresAt: 5,
+			Size:      int64(ver.SizeBytes),
+			Integrity: fmt.Sprintf("sha256-%s", integrity),
+			Algorithm: "SHA-256",
+		},
+	}, nil
+}
+
+func safeString(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 func (s *PluginService) UpdateStatus(ctx context.Context, userID, name, version, status string) error {
@@ -297,13 +424,13 @@ func (s *PluginService) UpdateStatus(ctx context.Context, userID, name, version,
 		return err
 	}
 
-	plugin, err := s.repository.GetByName(ctx, pName)
+	plugin, err := s.repository.FindPluginSummary(ctx, *domain.NewPluginFindBy().WithName(pName.String()))
 	if err != nil || plugin == nil {
-		return domain.NewNotFoundError("Plugin not found")
+		return errors.NotFound("Plugin not found").Cause(err)
 	}
 
 	if plugin.Owner.ID != userID {
-		return domain.NewUnauthorizedError("You are not the owner of this plugin")
+		return errors.Unauthorized("You are not the owner of this plugin")
 	}
 
 	nextStatus, err := domain.ParsePluginStatus(status)
@@ -312,7 +439,7 @@ func (s *PluginService) UpdateStatus(ctx context.Context, userID, name, version,
 	}
 
 	if !plugin.Status.CanTransitionTo(nextStatus) {
-		return domain.NewValidationError(fmt.Sprintf("Cannot transition from %s to %s", plugin.Status, status))
+		return errors.BadRequest(fmt.Sprintf("Cannot transition from %s to %s", plugin.Status, status))
 	}
 
 	return s.repository.UpdateStatus(ctx, plugin.ID, nextStatus)
@@ -324,26 +451,27 @@ func (s *PluginService) DeleteVersion(ctx context.Context, userID, name, version
 		return err
 	}
 
-	plugin, err := s.repository.GetByName(ctx, pName)
+	filters := domain.NewPluginFindBy().WithName(pName.String()).WithVersion(version)
+	plugin, err := s.repository.FindPluginSummary(ctx, *filters)
 	if err != nil || plugin == nil {
-		return domain.NewNotFoundError("Plugin not found")
+		return errors.NotFound("Plugin not found").Cause(err)
 	}
 
+	// Only the owner can delete a plugin version
 	if plugin.Owner.ID != userID {
-		return domain.NewUnauthorizedError("You are not the owner of this plugin")
+		return errors.Unauthorized("You are not the owner of this plugin")
 	}
 
-	// Simply mark as archived for now
 	return s.repository.UpdateStatus(ctx, plugin.ID, domain.PluginStatusArchived)
 }
 
-// Para usar en el controller
 func (s *PluginService) GetPlugin(ctx context.Context, name string) (*domain.Plugin, error) {
 	return s.GetDetail(ctx, name)
 }
 
 func (s *PluginService) FetchFile(ctx context.Context, name, version string) (io.ReadCloser, error) {
-	return s.storage.Fetch(ctx, name, version)
+	key := fmt.Sprintf("%s/%s.tar.gz", name, version)
+	return s.storage.Get(ctx, key)
 }
 
 func ptr[T any](v T) *T {

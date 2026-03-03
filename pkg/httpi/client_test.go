@@ -761,7 +761,7 @@ func TestBuildURL(t *testing.T) {
 		{"https://api.example.com", "users", "https://api.example.com/users"},
 		{"https://api.example.com/", "users", "https://api.example.com/users"},
 		{"", "/users", "/users"},
-		{"https://api.example.com", "", "https://api.example.com/"},
+		{"https://api.example.com", "", "https://api.example.com"},
 	}
 
 	for _, test := range tests {

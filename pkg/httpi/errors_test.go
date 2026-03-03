@@ -232,98 +232,6 @@ func TestErrWrapping(t *testing.T) {
 	})
 }
 
-func TestValidate(t *testing.T) {
-	type TestStruct struct {
-		Email    string `validate:"required,email"`
-		Password string `validate:"required,min=8"`
-		Age      int    `validate:"min=0,max=120"`
-	}
-
-	t.Run("Valid struct", func(t *testing.T) {
-		valid := TestStruct{
-			Email:    "test@example.com",
-			Password: "password123",
-			Age:      25,
-		}
-
-		err := Validate(valid)
-		if err != nil {
-			t.Errorf("Expected no validation error, got %v", err)
-		}
-	})
-
-	t.Run("Invalid struct", func(t *testing.T) {
-		invalid := TestStruct{
-			Email:    "invalid-email",
-			Password: "123", // too short
-			Age:      -1,    // negative
-		}
-
-		err := Validate(invalid)
-		if err == nil {
-			t.Error("Expected validation error")
-		}
-
-		var httpErr *Err
-		if !errors.As(err, &httpErr) {
-			t.Error("Expected HTTP error type")
-		} else {
-			if httpErr.Err.Code != "VALIDATION_ERROR" {
-				t.Errorf("Expected VALIDATION_ERROR code, got %s", httpErr.Err.Code)
-			}
-		}
-	})
-
-	t.Run("Invalid validation target", func(t *testing.T) {
-		// Test with non-struct type
-		err := Validate("not a struct")
-		if err == nil {
-			t.Error("Expected validation error for invalid target")
-		}
-
-		var httpErr *Err
-		if !errors.As(err, &httpErr) {
-			t.Error("Expected HTTP error type")
-		} else {
-			if httpErr.Err.Code != "INTERNAL_ERROR" {
-				t.Errorf("Expected INTERNAL_ERROR code, got %s", httpErr.Err.Code)
-			}
-		}
-	})
-}
-
-func TestCustomValidation_EmailOrPhone(t *testing.T) {
-	type TestStruct struct {
-		Contact string `validate:"email-or-phone"`
-	}
-
-	t.Run("Valid email", func(t *testing.T) {
-		data := TestStruct{Contact: "test@example.com"}
-		err := Validate(data)
-		if err != nil {
-			t.Errorf("Expected valid email to pass, got %v", err)
-		}
-	})
-
-	t.Run("Valid phone (assuming utils.IsValidPhone works)", func(t *testing.T) {
-		// Note: This test depends on the implementation of utils.IsValidPhone
-		// We're assuming it validates phone numbers correctly
-		data := TestStruct{Contact: "+1234567890"}
-		err := Validate(data)
-		// We can't be sure about the validation result without knowing the utils implementation
-		// This test is more about ensuring the validator is registered
-		_ = err // Acknowledge we're not asserting on the result
-	})
-
-	t.Run("Invalid email and phone", func(t *testing.T) {
-		data := TestStruct{Contact: "invalid"}
-		err := Validate(data)
-		if err == nil {
-			t.Error("Expected validation error for invalid email/phone")
-		}
-	})
-}
-
 // Mock implementations for testing error handler
 type mockHttpRequest struct {
 	headers map[string]string
@@ -385,6 +293,8 @@ func (m *mockHttpResponse) Redirect(path string, status int) error        { retu
 func (m *mockHttpResponse) SetBodyStreamWriter(writer StreamWriter) error { return nil }
 func (m *mockHttpResponse) Cookie(cookie *Cookie) HttpResponse            { return m }
 func (m *mockHttpResponse) Cookies(cookies ...*Cookie) HttpResponse       { return m }
+func (m *mockHttpResponse) Ok() HttpResponse                              { return m }
+func (m *mockHttpResponse) NoContent() error                              { return nil }
 
 func TestHttpErrorHandler(t *testing.T) {
 	t.Run("No error", func(t *testing.T) {

@@ -52,6 +52,7 @@ type UserClaims struct {
 	jwt.RegisteredClaims
 	UserID string `json:"user_id"`
 	Role   string `json:"role"`
+	Scope  string `json:"scope"`
 	Email  string `json:"email"`
 }
 
@@ -68,6 +69,7 @@ func (m *jwtManager) Sign(payload domain.TokenPayload) (domain.AuthToken, error)
 		},
 		UserID: payload.UserID,
 		Role:   payload.Role,
+		Scope:  payload.Scope,
 		Email:  payload.Email,
 	}
 
@@ -119,5 +121,6 @@ func (m *jwtManager) Parse(tokenStr string) (domain.Claims, error) {
 		Iat:   uint64(claims.IssuedAt.Unix()),
 		Email: claims.Email,
 		Role:  claims.Role,
+		Scope: claims.Scope,
 	}, nil
 }

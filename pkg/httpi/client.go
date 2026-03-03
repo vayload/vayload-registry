@@ -38,8 +38,8 @@ type HttpClient struct {
 	events               map[EventName][]EventHandler
 	Params               map[string]string
 	Auth                 *BasicAuth
-	mutex                sync.RWMutex // Para events
-	configMutex          sync.RWMutex // Para headers, params, interceptors
+	mutex                sync.RWMutex // For events
+	configMutex          sync.RWMutex // For headers, params, interceptors
 	requestAt            time.Time
 }
 
@@ -138,9 +138,15 @@ func (c *HttpClient) request(ctx context.Context, method, path string, body any,
 	var contentType string = "application/json"
 
 	if body != nil {
-		headers := c.getHeaders()
-		if ct, exists := headers["Content-Type"]; exists {
-			contentType = ct
+		if config != nil && len(config) > 0 {
+			if config[0].Headers != nil {
+				contentType = config[0].Headers["Content-Type"]
+			}
+		} else {
+			headers := c.getHeaders()
+			if ct, exists := headers["Content-Type"]; exists {
+				contentType = ct
+			}
 		}
 
 		var err error
@@ -279,7 +285,6 @@ func (c *HttpClient) PostForm(ctx context.Context, path string, formData string,
 		},
 	}
 
-	// Merge con headers proporcionados
 	if len(headers) > 0 && headers[0].Headers != nil {
 		maps.Copy(config.Headers, headers[0].Headers)
 	}
@@ -426,10 +431,17 @@ func (c *HttpClient) Copy() *HttpClient {
 }
 
 func buildURL(baseURL, path string) string {
-	base := strings.TrimSuffix(baseURL, "/")
-	path = strings.TrimPrefix(path, "/")
+	base := strings.Trim(baseURL, "/")
+	parts := strings.FieldsFunc(strings.Trim(path, "/"), func(r rune) bool {
+		return r == '/'
+	})
+	path = strings.Join(parts, "/")
+
 	if base == "" {
-		return path
+		return "/" + path
+	}
+	if path == "" {
+		return base
 	}
 
 	return base + "/" + path

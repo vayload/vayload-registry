@@ -3,23 +3,62 @@ package persistence
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"time"
 
-	"github.com/jmoiron/sqlx"
 	"github.com/vayload/plug-registry/internal/domain"
+	"github.com/vayload/plug-registry/internal/infrastructure/database"
 )
 
 type pluginRepository struct {
-	db *sqlx.DB
+	db database.Queryer
 }
 
-func NewPluginRepository(db *sqlx.DB) domain.PluginRepository {
+func NewPluginRepository(db database.Queryer) domain.PluginRepository {
 	return &pluginRepository{db: db}
 }
 
-func (r *pluginRepository) Create(ctx context.Context, plugin domain.Plugin) (domain.Plugin, error) {
-	query := `INSERT INTO plugins (id, owner_id, name, display_name, description, homepage_url, repo_url, documentation_url, readme, license, license_type, visibility, tags, status, pricing_type, total_downloads, latest_stable_version, latest_beta_version, created_at, updated_at)
-	          VALUES (:id, :owner_id, :name, :display_name, :description, :homepage_url, :repo_url, :documentation_url, :readme, :license, :license_type, :visibility, :tags, :status, :pricing_type, :total_downloads, :latest_stable_version, :latest_beta_version, :created_at, :updated_at)`
+func (r *pluginRepository) CreatePlugin(ctx context.Context, plugin domain.Plugin) (domain.Plugin, error) {
+	query := `
+	INSERT INTO plugins (
+	    id,
+	    owner_id,
+	    name,
+	    display_name,
+	    namespace,
+	    description,
+	    homepage_url,
+	    repo_url,
+	    documentation_url,
+	    visibility,
+	    tags,
+	    status,
+	    pricing_type,
+	    total_downloads,
+	    latest_stable_version,
+	    latest_beta_version,
+	    created_at,
+	    updated_at
+	) VALUES (
+	    :id,
+	    :owner_id,
+	    :name,
+	    :display_name,
+	    :namespace,
+	    :description,
+	    :homepage_url,
+	    :repo_url,
+	    :documentation_url,
+	    :visibility,
+	    :tags,
+	    :status,
+	    :pricing_type,
+	    :total_downloads,
+	    :latest_stable_version,
+	    :latest_beta_version,
+	    :created_at,
+	    :updated_at
+	)`
 
 	model := NewPluginModel(&plugin)
 
@@ -27,53 +66,168 @@ func (r *pluginRepository) Create(ctx context.Context, plugin domain.Plugin) (do
 	return plugin, err
 }
 
-func (r *pluginRepository) GetByID(ctx context.Context, id domain.PluginId) (*domain.Plugin, error) {
+func (r *pluginRepository) FindPluginSummary(ctx context.Context, filters domain.PluginFindBy) (*domain.Plugin, error) {
+	baseQuery := "SELECT * FROM plugins p "
+	conditions := []string{}
+	args := []any{}
+
+	if filters.ID != nil {
+		conditions = append(conditions, "p.id = ?")
+		args = append(args, *filters.ID)
+	}
+	// for this criteria need join with plugin_versions table
+	if filters.Version != nil {
+		baseQuery += "JOIN plugin_versions pv ON p.id = pv.plugin_id "
+		conditions = append(conditions, "pv.version = ?")
+		args = append(args, *filters.Version)
+	}
+	if filters.Name != nil {
+		conditions = append(conditions, "p.name = ?")
+		args = append(args, *filters.Name)
+	}
+	if filters.OwnerID != nil {
+		conditions = append(conditions, "p.owner_id = ?")
+		args = append(args, *filters.OwnerID)
+	}
+	if filters.Status != nil {
+		conditions = append(conditions, "p.status = ?")
+		args = append(args, *filters.Status)
+	}
+
+	query := baseQuery
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
+
 	model := PluginModel{}
-	err := r.db.GetContext(ctx, &model, "SELECT * FROM plugins WHERE id = ? AND deleted_at IS NULL", id.String())
+	err := r.db.GetContext(ctx, &model, query+"AND p.deleted_at IS NULL LIMIT 1", args...)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, nil
+			return nil, domain.ErrNotResultSet
 		}
+
 		return nil, err
 	}
 
 	return model.MapToDomain(), nil
 }
 
-func (r *pluginRepository) GetByName(ctx context.Context, name domain.PluginName) (*domain.Plugin, error) {
-	model := PluginModel{}
-	err := r.db.GetContext(ctx, &model, "SELECT * FROM plugins WHERE name = ? AND deleted_at IS NULL", name.String())
+func (r *pluginRepository) FindPluginDetails(ctx context.Context, filters domain.PluginFindBy) (*domain.Plugin, error) {
+	model := DetailedPluginModel{}
+	query := `
+    SELECT
+        p.*,
+        v.version,
+        v.published_at,
+        v.yanked,
+        v.yank_reason,
+        v.license_type,
+        v.integrity,
+        v.filename,
+        v.size_bytes,
+        v.total_files,
+        v.downloads_count,
+        v.changelog,
+        ro.blob as readme_blob,
+        lo.blob as license_blob,
+        ro.mime_type as readme_mime_type,
+        lo.mime_type as license_mime_type
+    FROM plugins p
+    JOIN plugin_versions v ON v.plugin_id = p.id AND v.version = (
+    	-- Fetch the latest version if the target version is not provided
+    	COALESCE(NULLIF(?, ''), p.latest_stable_version, (SELECT version FROM plugin_versions WHERE plugin_id = p.id ORDER BY created_at DESC LIMIT 1))
+    )
+    LEFT JOIN storage_objects ro ON v.readme_object = ro.object_hash
+    LEFT JOIN storage_objects lo ON v.license_object = lo.object_hash
+    WHERE p.deleted_at IS NULL
+    `
+
+	conditions := []string{}
+	targetVersion := ""
+	if filters.Version != nil {
+		targetVersion = *filters.Version
+	}
+	args := []any{targetVersion}
+
+	if filters.ID != nil {
+		conditions = append(conditions, "p.id = ?")
+		args = append(args, *filters.ID)
+	}
+	if filters.Name != nil {
+		conditions = append(conditions, "p.name = ?")
+		args = append(args, *filters.Name)
+	}
+	if filters.OwnerID != nil {
+		conditions = append(conditions, "p.owner_id = ?")
+		args = append(args, *filters.OwnerID)
+	}
+
+	if len(conditions) > 0 {
+		query += " AND " + strings.Join(conditions, " AND ")
+	}
+	query += " LIMIT 1"
+
+	err := r.db.GetContext(ctx, &model, query, args...)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, nil
+			return nil, domain.ErrNotResultSet
 		}
+
 		return nil, err
 	}
 
-	return model.MapToDomain(), nil
+	plugin := model.PluginModel.MapToDomain()
+	plugin.Readme = stringPtr(string(model.ReadmeBlob))
+	plugin.License = stringPtr(string(model.LicenseBlob))
+	plugin.LicenseType = stringPtr(model.LicenseType.String)
+
+	return plugin, nil
 }
 
-func (r *pluginRepository) GetByNameAndVersion(ctx context.Context, name domain.PluginName, version string) (*domain.Plugin, error) {
-	model := PluginModel{}
-	err := r.db.GetContext(ctx, &model, `SELECT p.* FROM plugins p 
-	                                 JOIN plugin_versions v ON p.id = v.plugin_id 
-	                                 WHERE p.name = ? AND v.version = ? AND p.deleted_at IS NULL`, name.String(), version)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, err
+func (r *pluginRepository) HasMatchingPlugin(ctx context.Context, filters domain.PluginFindBy) (bool, error) {
+	baseQuery := "SELECT EXISTS(SELECT 1 FROM plugins p "
+	conditions := []string{}
+	args := []any{}
+
+	if filters.ID != nil {
+		conditions = append(conditions, "p.id = ?")
+		args = append(args, *filters.ID)
+	}
+	// for this criteria need join with plugin_versions table
+	if filters.Version != nil {
+		baseQuery += "JOIN plugin_versions pv ON p.id = pv.plugin_id "
+		conditions = append(conditions, "pv.version = ?")
+		args = append(args, *filters.Version)
+	}
+	if filters.Name != nil {
+		conditions = append(conditions, "p.name = ?")
+		args = append(args, *filters.Name)
+	}
+	if filters.OwnerID != nil {
+		conditions = append(conditions, "p.owner_id = ?")
+		args = append(args, *filters.OwnerID)
+	}
+	if filters.Status != nil {
+		conditions = append(conditions, "p.status = ?")
+		args = append(args, *filters.Status)
 	}
 
-	return model.MapToDomain(), nil
-}
+	query := baseQuery
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
 
-func (r *pluginRepository) HasVersionUploaded(ctx context.Context, name domain.PluginName, version string) (bool, error) {
-	var exists bool
-	err := r.db.GetContext(ctx, &exists, `SELECT EXISTS(SELECT 1 FROM plugins p 
-	                                           JOIN plugin_versions v ON p.id = v.plugin_id 
-	                                           WHERE p.name = ? AND v.version = ?)`, name.String(), version)
-	return exists, err
+	var exist bool
+	err := r.db.GetContext(ctx, &exist, query+"AND p.deleted_at IS NULL LIMIT 1)", args...)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return false, domain.ErrNotResultSet
+		}
+
+		return false, err
+	}
+
+	return exist, nil
 }
 
 func (r *pluginRepository) ListByOwner(ctx context.Context, ownerID string) ([]domain.Plugin, error) {
@@ -87,6 +241,7 @@ func (r *pluginRepository) ListByOwner(ctx context.Context, ownerID string) ([]d
 	for i, m := range models {
 		plugins[i] = *m.MapToDomain()
 	}
+
 	return plugins, nil
 }
 
@@ -142,8 +297,8 @@ func (r *pluginRepository) SearchWithFilters(ctx context.Context, filter domain.
 }
 
 func (r *pluginRepository) CreateVersion(ctx context.Context, version domain.PluginVersion) (domain.PluginVersion, error) {
-	query := `INSERT INTO plugin_versions (id, plugin_id, version, published_at, yanked, yank_reason, status, manifest_json, sha256, filename, size_bytes, total_files, downloads_count, min_app_version, max_app_version, changelog)
-	          VALUES (:id, :plugin_id, :version, :published_at, :yanked, :yank_reason, :status, :manifest_json, :sha256, :filename, :size_bytes, :total_files, :downloads_count, :min_app_version, :max_app_version, :changelog)`
+	query := `INSERT INTO plugin_versions (id, plugin_id, version, published_at, yanked, yank_reason, status, manifest_object, readme_object, license_object, license_type, integrity, filename, size_bytes, total_files, downloads_count, changelog)
+	          VALUES (:id, :plugin_id, :version, :published_at, :yanked, :yank_reason, :status, :manifest_object, :readme_object, :license_object, :license_type, :integrity, :filename, :size_bytes, :total_files, :downloads_count, :changelog)`
 
 	model := NewPluginVersionModel(&version)
 
@@ -156,8 +311,9 @@ func (r *pluginRepository) GetVersion(ctx context.Context, pluginID domain.Plugi
 	err := r.db.GetContext(ctx, &model, "SELECT * FROM plugin_versions WHERE plugin_id = ? AND version = ?", pluginID.String(), version)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, nil
+			return nil, domain.ErrNotResultSet
 		}
+
 		return nil, err
 	}
 
@@ -165,23 +321,23 @@ func (r *pluginRepository) GetVersion(ctx context.Context, pluginID domain.Plugi
 }
 
 func (r *pluginRepository) UpdateDownloads(ctx context.Context, pluginID domain.PluginId, version string, downloads uint32) error {
-	tx, err := r.db.BeginTxx(ctx, nil)
+	if transactor, ok := r.db.(database.Transactor); ok {
+		return transactor.Transaction(ctx, func(ctx context.Context, tx database.Queryer) error {
+			return r.updateDownloads(ctx, tx, pluginID, version, downloads)
+		})
+	}
+
+	return r.updateDownloads(ctx, r.db, pluginID, version, downloads)
+}
+
+func (r *pluginRepository) updateDownloads(ctx context.Context, q database.Queryer, pluginID domain.PluginId, version string, downloads uint32) error {
+	_, err := q.ExecContext(ctx, "UPDATE plugin_versions SET downloads_count = downloads_count + ? WHERE plugin_id = ? AND version = ?", downloads, pluginID.String(), version)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
 
-	_, err = tx.ExecContext(ctx, "UPDATE plugin_versions SET downloads_count = downloads_count + ? WHERE plugin_id = ? AND version = ?", downloads, pluginID.String(), version)
-	if err != nil {
-		return err
-	}
-
-	_, err = tx.ExecContext(ctx, "UPDATE plugins SET total_downloads = total_downloads + ? WHERE id = ?", downloads, pluginID.String())
-	if err != nil {
-		return err
-	}
-
-	return tx.Commit()
+	_, err = q.ExecContext(ctx, "UPDATE plugins SET total_downloads = total_downloads + ? WHERE id = ?", downloads, pluginID.String())
+	return err
 }
 
 func (r *pluginRepository) UpdateLatestVersions(ctx context.Context, pluginID domain.PluginId, latestVersions string) error {
@@ -210,10 +366,46 @@ func (r *pluginRepository) GetTask(ctx context.Context, taskID string) (*domain.
 	err := r.db.GetContext(ctx, &model, "SELECT * FROM plugin_tasks WHERE id = ?", taskID)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, nil
+			return nil, domain.ErrNotResultSet
 		}
+
 		return nil, err
 	}
 
 	return model.MapToDomain(), nil
+}
+
+func (r *pluginRepository) GetAggregatedStats(ctx context.Context, ownerID string) (totalPlugins, totalDownloads, totalVersions int, err error) {
+	query := `
+		SELECT 
+			COUNT(DISTINCT p.id) as total_plugins,
+			COALESCE(SUM(p.total_downloads), 0) as total_downloads,
+			COUNT(pv.id) as total_versions
+		FROM plugins p
+		LEFT JOIN plugin_versions pv ON p.id = pv.plugin_id
+		WHERE p.owner_id = ? AND p.deleted_at IS NULL
+	`
+	err = r.db.QueryRowContext(ctx, query, ownerID).Scan(&totalPlugins, &totalDownloads, &totalVersions)
+	return
+}
+
+func (r *pluginRepository) GetLatestAuditLogs(ctx context.Context, userID string, limit int) ([]domain.AuditLog, error) {
+	query := `
+		SELECT * FROM audit_logs 
+		WHERE user_id = ? 
+		ORDER BY created_at DESC 
+		LIMIT ?
+	`
+	var logs []AuditLogModel
+	err := r.db.SelectContext(ctx, &logs, query, userID, limit)
+	if err != nil {
+		return nil, err
+	}
+
+	auditLogs := make([]domain.AuditLog, len(logs))
+	for i, log := range logs {
+		auditLogs[i] = *log.MapToDomain()
+	}
+
+	return auditLogs, nil
 }

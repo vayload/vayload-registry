@@ -1,4 +1,5 @@
 //go:build !cache_redis
+// +build !cache_redis
 
 package cache
 

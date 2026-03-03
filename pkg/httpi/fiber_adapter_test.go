@@ -18,128 +18,152 @@ import (
 func TestHttpRequest(t *testing.T) {
 	app := fiber.New()
 
-	var capturedRequest HttpRequest
-	app.Get("/test/:id", func(c *fiber.Ctx) error {
-		capturedRequest = NewHttpRequest(c)
-		return c.JSON(map[string]string{"status": "ok"})
-	})
-
-	app.Post("/test-post", func(c *fiber.Ctx) error {
-		capturedRequest = NewHttpRequest(c)
-		return c.JSON(map[string]string{"status": "ok"})
-	})
-
 	t.Run("GetParam", func(t *testing.T) {
+		app.Get("/test/:id", func(c *fiber.Ctx) error {
+			req := NewHttpRequest(c)
+
+			if req.GetParam("id") != "123" {
+				t.Errorf("Expected param 'id' to be '123'")
+			}
+
+			if req.GetParam("nonexistent", "default") != "default" {
+				t.Errorf("Expected default value 'default'")
+			}
+
+			return nil
+		})
+
 		req := httptest.NewRequest("GET", "/test/123", nil)
 		_, err := app.Test(req)
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
-
-		if capturedRequest.GetParam("id") != "123" {
-			t.Errorf("Expected param 'id' to be '123', got %s", capturedRequest.GetParam("id"))
-		}
-
-		if capturedRequest.GetParam("nonexistent", "default") != "default" {
-			t.Errorf("Expected default value 'default', got %s", capturedRequest.GetParam("nonexistent", "default"))
-		}
 	})
 
 	t.Run("GetParamInt", func(t *testing.T) {
-		req := httptest.NewRequest("GET", "/test/456", nil)
+		app.Get("/test-int/:id", func(c *fiber.Ctx) error {
+			req := NewHttpRequest(c)
+
+			value, err := req.GetParamInt("id")
+			if err != nil {
+				t.Fatalf("Expected no error parsing int, got %v", err)
+			}
+			if value != 456 {
+				t.Errorf("Expected 456, got %d", value)
+			}
+
+			return nil
+		})
+
+		req := httptest.NewRequest("GET", "/test-int/456", nil)
 		_, err := app.Test(req)
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
-
-		value, err := capturedRequest.GetParamInt("id")
-		if err != nil {
-			t.Fatalf("Expected no error parsing int, got %v", err)
-		}
-		if value != 456 {
-			t.Errorf("Expected param 'id' to be 456, got %d", value)
-		}
 	})
 
 	t.Run("Request methods and headers", func(t *testing.T) {
-		req := httptest.NewRequest("POST", "/test-post?query=value", strings.NewReader(`{"key": "value"}`))
+		app.Post("/test-post", func(c *fiber.Ctx) error {
+			req := NewHttpRequest(c)
+
+			if req.GetMethod() != "POST" {
+				t.Errorf("Expected method POST")
+			}
+
+			if req.GetPath() != "/test-post" {
+				t.Errorf("Expected path '/test-post'")
+			}
+
+			if req.GetQuery("query") != "value" {
+				t.Errorf("Expected query 'value'")
+			}
+
+			if req.GetHeader("Content-Type") != "application/json" {
+				t.Errorf("Wrong Content-Type")
+			}
+
+			if req.GetHeader("Authorization") != "Bearer token123" {
+				t.Errorf("Wrong Authorization header")
+			}
+
+			if req.GetIP() == "" {
+				t.Error("Expected IP to be set")
+			}
+
+			return nil
+		})
+
+		req := httptest.NewRequest("POST", "/test-post?query=value",
+			strings.NewReader(`{"key": "value"}`))
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", "TestAgent/1.0")
 		req.Header.Set("Authorization", "Bearer token123")
 
 		_, err := app.Test(req)
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
-
-		if capturedRequest.GetMethod() != "POST" {
-			t.Errorf("Expected method 'POST', got %s", capturedRequest.GetMethod())
-		}
-
-		if capturedRequest.GetPath() != "/test-post" {
-			t.Errorf("Expected path '/test-post', got %s", capturedRequest.GetPath())
-		}
-
-		if capturedRequest.GetQuery("query") != "value" {
-			t.Errorf("Expected query 'query' to be 'value', got %s", capturedRequest.GetQuery("query"))
-		}
-
-		if capturedRequest.GetHeader("Content-Type") != "application/json" {
-			t.Errorf("Expected Content-Type 'application/json', got %s", capturedRequest.GetHeader("Content-Type"))
-		}
-
-		if capturedRequest.GetHeader("Authorization") != "Bearer token123" {
-			t.Errorf("Expected Authorization 'Bearer token123', got %s", capturedRequest.GetHeader("Authorization"))
-		}
-
-		if capturedRequest.GetIP() == "" {
-			t.Error("Expected IP to be set")
-		}
 	})
 
 	t.Run("Queries", func(t *testing.T) {
-		req := httptest.NewRequest("GET", "/test/123?param1=value1&param2=value2", nil)
+		app.Get("/test-queries", func(c *fiber.Ctx) error {
+			req := NewHttpRequest(c)
+
+			queries := req.Queries()
+
+			if queries["param1"] != "value1" {
+				t.Errorf("Expected param1 'value1'")
+			}
+			if queries["param2"] != "value2" {
+				t.Errorf("Expected param2 'value2'")
+			}
+
+			return nil
+		})
+
+		req := httptest.NewRequest(
+			"GET",
+			"/test-queries?param1=value1&param2=value2",
+			nil,
+		)
+
 		_, err := app.Test(req)
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
-		}
-
-		queries := capturedRequest.Queries()
-		if queries["param1"] != "value1" {
-			t.Errorf("Expected param1 'value1', got %s", queries["param1"])
-		}
-		if queries["param2"] != "value2" {
-			t.Errorf("Expected param2 'value2', got %s", queries["param2"])
 		}
 	})
 
 	t.Run("GetQueryInt", func(t *testing.T) {
-		req := httptest.NewRequest("GET", "/test/123?page=5", nil)
+		app.Get("/test-query-int", func(c *fiber.Ctx) error {
+			req := NewHttpRequest(c)
+
+			page := req.GetQueryInt("page")
+			if page != 5 {
+				t.Errorf("Expected page 5, got %d", page)
+			}
+
+			nonExistent := req.GetQueryInt("nonexistent", 10)
+			if nonExistent != 10 {
+				t.Errorf("Expected default value 10")
+			}
+
+			return nil
+		})
+
+		req := httptest.NewRequest(
+			"GET",
+			"/test-query-int?page=5",
+			nil,
+		)
+
 		_, err := app.Test(req)
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
-		}
-
-		page := capturedRequest.GetQueryInt("page")
-		if page != 5 {
-			t.Errorf("Expected page 5, got %d", page)
-		}
-
-		nonExistent := capturedRequest.GetQueryInt("nonexistent", 10)
-		if nonExistent != 10 {
-			t.Errorf("Expected default value 10, got %d", nonExistent)
 		}
 	})
 }
 
 func TestHttpRequest_ParseBody(t *testing.T) {
 	app := fiber.New()
-
-	var capturedRequest HttpRequest
-	app.Post("/test", func(c *fiber.Ctx) error {
-		capturedRequest = NewHttpRequest(c)
-		return c.JSON(map[string]string{"status": "ok"})
-	})
 
 	type TestStruct struct {
 		Name  string `json:"name"`
@@ -150,6 +174,23 @@ func TestHttpRequest_ParseBody(t *testing.T) {
 		Name:  "John Doe",
 		Email: "john@example.com",
 	}
+	app.Post("/test", func(c *fiber.Ctx) error {
+		capturedRequest := NewHttpRequest(c)
+
+		var parsed TestStruct
+		err := capturedRequest.ParseBody(&parsed)
+		if err != nil {
+			t.Fatalf("ParseBody failed: %v", err)
+		}
+
+		if parsed.Name != testData.Name {
+			t.Errorf("Expected Name '%s', got '%s'", testData.Name, parsed.Name)
+		}
+		if parsed.Email != testData.Email {
+			t.Errorf("Expected Email '%s', got '%s'", testData.Email, parsed.Email)
+		}
+		return c.JSON(map[string]string{"status": "ok"})
+	})
 
 	jsonData, _ := json.Marshal(testData)
 	req := httptest.NewRequest("POST", "/test", bytes.NewReader(jsonData))
@@ -160,162 +201,6 @@ func TestHttpRequest_ParseBody(t *testing.T) {
 		t.Fatalf("Request failed: %v", err)
 	}
 
-	var parsed TestStruct
-	err = capturedRequest.ParseBody(&parsed)
-	if err != nil {
-		t.Fatalf("ParseBody failed: %v", err)
-	}
-
-	if parsed.Name != testData.Name {
-		t.Errorf("Expected Name '%s', got '%s'", testData.Name, parsed.Name)
-	}
-	if parsed.Email != testData.Email {
-		t.Errorf("Expected Email '%s', got '%s'", testData.Email, parsed.Email)
-	}
-}
-
-func TestHttpRequest_Validate(t *testing.T) {
-	type TestStruct struct {
-		Email string `validate:"required,email"`
-		Age   int    `validate:"min=0,max=120"`
-	}
-
-	req := NewHttpRequest(&fiber.Ctx{})
-
-	t.Run("Valid data", func(t *testing.T) {
-		valid := TestStruct{
-			Email: "test@example.com",
-			Age:   25,
-		}
-
-		err := req.Validate(valid)
-		if err != nil {
-			t.Errorf("Expected no validation error, got %v", err)
-		}
-	})
-
-	t.Run("Invalid data", func(t *testing.T) {
-		invalid := TestStruct{
-			Email: "invalid-email",
-			Age:   -1,
-		}
-
-		err := req.Validate(invalid)
-		if err == nil {
-			t.Error("Expected validation error")
-		}
-
-		var httpErr *Err
-		if !errors.As(err, &httpErr) {
-			t.Error("Expected HTTP error type")
-		} else {
-			if httpErr.Err.Code != "VALIDATION_ERROR" {
-				t.Errorf("Expected VALIDATION_ERROR code, got %s", httpErr.Err.Code)
-			}
-		}
-	})
-}
-
-func TestHttpRequest_ValidateBody(t *testing.T) {
-	app := fiber.New()
-
-	var capturedRequest HttpRequest
-	app.Post("/test", func(c *fiber.Ctx) error {
-		capturedRequest = NewHttpRequest(c)
-		return c.JSON(map[string]string{"status": "ok"})
-	})
-
-	type TestStruct struct {
-		Email string `json:"email" validate:"required,email"`
-		Name  string `json:"name" validate:"required,min=2"`
-	}
-
-	t.Run("Valid body", func(t *testing.T) {
-		validData := TestStruct{
-			Email: "test@example.com",
-			Name:  "John Doe",
-		}
-
-		jsonData, _ := json.Marshal(validData)
-		req := httptest.NewRequest("POST", "/test", bytes.NewReader(jsonData))
-		req.Header.Set("Content-Type", "application/json")
-
-		_, err := app.Test(req)
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
-
-		var parsed TestStruct
-		err = capturedRequest.ValidateBody(&parsed)
-		if err != nil {
-			t.Errorf("Expected no validation error, got %v", err)
-		}
-
-		if parsed.Email != validData.Email {
-			t.Errorf("Expected email '%s', got '%s'", validData.Email, parsed.Email)
-		}
-	})
-
-	t.Run("Invalid JSON", func(t *testing.T) {
-		req := httptest.NewRequest("POST", "/test", strings.NewReader("invalid json"))
-		req.Header.Set("Content-Type", "application/json")
-
-		_, err := app.Test(req)
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
-
-		var parsed TestStruct
-		err = capturedRequest.ValidateBody(&parsed)
-		if err == nil {
-			t.Error("Expected error for invalid JSON")
-		}
-
-		var httpErr *Err
-		if !errors.As(err, &httpErr) {
-			t.Error("Expected HTTP error type")
-		} else {
-			if httpErr.Err.Code != "BAD_REQUEST" {
-				t.Errorf("Expected BAD_REQUEST code, got %s", httpErr.Err.Code)
-			}
-		}
-	})
-
-	t.Run("Invalid validation", func(t *testing.T) {
-		invalidData := TestStruct{
-			Email: "invalid-email",
-			Name:  "A", // too short
-		}
-
-		jsonData, _ := json.Marshal(invalidData)
-		req := httptest.NewRequest("POST", "/test", bytes.NewReader(jsonData))
-		req.Header.Set("Content-Type", "application/json")
-
-		_, err := app.Test(req)
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
-
-		var parsed TestStruct
-		err = capturedRequest.ValidateBody(&parsed)
-		if err == nil {
-			t.Error("Expected validation error")
-		}
-
-		var httpErr *Err
-		if !errors.As(err, &httpErr) {
-			t.Error("Expected HTTP error type")
-		} else {
-			if httpErr.Err.Code != "VALIDATION_ERROR" {
-				t.Errorf("Expected VALIDATION_ERROR code, got %s", httpErr.Err.Code)
-			}
-
-			// Check if details contain field validation errors
-			if httpErr.Err.Details == nil {
-				t.Error("Expected validation error details")
-			}
-		}
-	})
 }
 
 func TestHttpRequest_Auth(t *testing.T) {
@@ -324,6 +209,16 @@ func TestHttpRequest_Auth(t *testing.T) {
 	var capturedRequest HttpRequest
 	app.Get("/test", func(c *fiber.Ctx) error {
 		capturedRequest = NewHttpRequest(c)
+
+		auth := capturedRequest.Auth()
+		if auth == nil {
+			t.Fatal("Expected auth object to be returned")
+		}
+
+		if auth.AccessToken != "" {
+			t.Errorf("Expected empty access token, got %s", auth.AccessToken)
+		}
+
 		return c.JSON(map[string]string{"status": "ok"})
 	})
 
@@ -334,6 +229,15 @@ func TestHttpRequest_Auth(t *testing.T) {
 		}
 		c.Locals("__auth__", auth)
 		capturedRequest = NewHttpRequest(c)
+
+		userAuth := capturedRequest.Auth()
+		if userAuth == nil {
+			t.Fatal("Expected auth object to be returned")
+		}
+
+		if userAuth.AccessToken != "token-abc" {
+			t.Errorf("Expected AccessToken 'token-abc', got %s", auth.AccessToken)
+		}
 		return c.JSON(map[string]string{"status": "ok"})
 	})
 
@@ -344,14 +248,6 @@ func TestHttpRequest_Auth(t *testing.T) {
 			t.Fatalf("Request failed: %v", err)
 		}
 
-		auth := capturedRequest.Auth()
-		if auth == nil {
-			t.Fatal("Expected auth object to be returned")
-		}
-
-		if auth.AccessToken != "" {
-			t.Errorf("Expected empty access token, got %s", auth.AccessToken)
-		}
 	})
 
 	t.Run("With auth data", func(t *testing.T) {
@@ -361,23 +257,31 @@ func TestHttpRequest_Auth(t *testing.T) {
 			t.Fatalf("Request failed: %v", err)
 		}
 
-		auth := capturedRequest.Auth()
-		if auth == nil {
-			t.Fatal("Expected auth object to be returned")
-		}
-
-		if auth.AccessToken != "token-abc" {
-			t.Errorf("Expected AccessToken 'token-abc', got %s", auth.AccessToken)
-		}
 	})
 }
 
 func TestHttpRequest_Locals(t *testing.T) {
 	app := fiber.New()
 
-	var capturedRequest HttpRequest
 	app.Get("/test", func(c *fiber.Ctx) error {
-		capturedRequest = NewHttpRequest(c)
+		capturedRequest := NewHttpRequest(c)
+		// Set a local value
+		result := capturedRequest.Locals("test-key", "test-value")
+		if result != "test-value" {
+			t.Errorf("Expected 'test-value', got %v", result)
+		}
+
+		// Get the local value
+		retrieved := capturedRequest.Locals("test-key", nil)
+		if retrieved != "test-value" {
+			t.Errorf("Expected 'test-value', got %v", retrieved)
+		}
+
+		// Get non-existent key
+		nonExistent := capturedRequest.Locals("non-existent", nil)
+		if nonExistent != nil {
+			t.Errorf("Expected nil for non-existent key, got %v", nonExistent)
+		}
 		return c.JSON(map[string]string{"status": "ok"})
 	})
 
@@ -387,23 +291,6 @@ func TestHttpRequest_Locals(t *testing.T) {
 		t.Fatalf("Request failed: %v", err)
 	}
 
-	// Set a local value
-	result := capturedRequest.Locals("test-key", "test-value")
-	if result != "test-value" {
-		t.Errorf("Expected 'test-value', got %v", result)
-	}
-
-	// Get the local value
-	retrieved := capturedRequest.Locals("test-key", nil)
-	if retrieved != "test-value" {
-		t.Errorf("Expected 'test-value', got %v", retrieved)
-	}
-
-	// Get non-existent key
-	nonExistent := capturedRequest.Locals("non-existent", nil)
-	if nonExistent != nil {
-		t.Errorf("Expected nil for non-existent key, got %v", nonExistent)
-	}
 }
 
 func TestHttpResponse(t *testing.T) {
@@ -559,7 +446,7 @@ func TestHttpResponse_Cookies(t *testing.T) {
 			if !strings.Contains(cookieStr, "HttpOnly") {
 				t.Errorf("Expected cookie to be HttpOnly, got %s", cookieStr)
 			}
-			if !strings.Contains(cookieStr, "Secure") {
+			if !strings.Contains(cookieStr, "secure") {
 				t.Errorf("Expected cookie to be Secure, got %s", cookieStr)
 			}
 		}

@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"fmt"
 	"strings"
+
+	"github.com/vayload/plug-registry/internal/shared/errors"
 )
 
 type HashingStrategy interface {
@@ -31,7 +33,7 @@ func ParseClientType(s string) (ClientType, error) {
 	case "cli":
 		return ClientTypeCli, nil
 	default:
-		return ClientTypeWeb, NewValidationError("Invalid client type")
+		return ClientTypeWeb, errors.Validation("Invalid client type")
 	}
 }
 
@@ -61,12 +63,12 @@ func (s OAuthState) ToBase64() string {
 func ParseOAuthState(s string) (OAuthState, error) {
 	bytes, err := base64.RawURLEncoding.DecodeString(s)
 	if err != nil {
-		return OAuthState{}, NewValidationError(fmt.Sprintf("Invalid base64: %v", err))
+		return OAuthState{}, errors.Validation(fmt.Sprintf("Invalid base64: %v", err))
 	}
 
 	parts := strings.Split(string(bytes), "|")
 	if len(parts) != 5 {
-		return OAuthState{}, NewValidationError("Invalid state format")
+		return OAuthState{}, errors.Validation("Invalid state format")
 	}
 
 	clientType, _ := ParseClientType(parts[4])
@@ -109,7 +111,7 @@ func ParseOAuthProvider(s string) (OAuthProvider, error) {
 	case "github":
 		return OAuthProviderGitHub, nil
 	default:
-		return "", NewConflictError("Invalid OAuth provider")
+		return "", errors.Conflict("Invalid OAuth provider")
 	}
 }
 
@@ -119,20 +121,20 @@ type OAuthStrategy interface {
 }
 
 type Claims struct {
-	Aud string
-	Sub string
-	Exp uint64
-	Iat uint64
-
-	// Custom claims
+	Aud   string
+	Sub   string
+	Exp   uint64
+	Iat   uint64
 	Email string
 	Role  string
+	Scope string
 }
 
 type TokenPayload struct {
 	UserID string
 	Email  string
 	Role   string
+	Scope  string
 }
 
 type TokenManager interface {

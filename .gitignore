@@ -24,6 +24,8 @@ build/
 .parcel-cache/
 .eslintcache
 .vite/
+# Queue worker logs
+pkg/queue/*.jsonl
 
 # Coverage
 coverage/

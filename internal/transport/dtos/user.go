@@ -1,6 +1,10 @@
 package dtos
 
-import "time"
+import (
+	"errors"
+	"strings"
+	"time"
+)
 
 type UserProfileResponse struct {
 	ID          string     `json:"id"`
@@ -14,11 +18,30 @@ type UserProfileResponse struct {
 }
 
 type CreateApiTokenRequest struct {
-	Name        string   `json:"name" validate:"required"`
-	Description *string  `json:"description"`
-	Scope       []string `json:"scope"`
-	ExpiresAt   *string  `json:"expires_at"`
-	PluginID    *string  `json:"plugin_id"`
+	Name        string  `json:"name" validate:"required"`
+	Description *string `json:"description"`
+	Scope       string  `json:"scope"`
+	ExpiresAt   *string `json:"expires_at"`
+	PluginID    *string `json:"plugin_id"`
+}
+
+func (req *CreateApiTokenRequest) Validate() error {
+	if req.Name == "" {
+		return errors.New("name is required")
+	}
+
+	parts := strings.Split(req.Scope, ":")
+	if len(parts) != 2 {
+		return errors.New("invalid scope format")
+	}
+
+	if strings.HasPrefix(req.Scope, "plugin:") {
+		if req.PluginID == nil {
+			return errors.New("plugin_id is required")
+		}
+	}
+
+	return nil
 }
 
 type ApiTokenResponse struct {

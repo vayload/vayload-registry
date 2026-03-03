@@ -1,10 +1,9 @@
 root = "."
-testdata_dir = "testdata"
 tmp_dir = "tmp"
 
 [build]
   bin = "tmp/main.exe"
-  cmd = "go build -o ./tmp/main.exe ./cmd/server/main.go"
+  cmd = "go build -tags=r2_storage -o ./tmp/main.exe ./cmd/server"
   delay = 500
   exclude_dir = ["assets", "tmp", "vendor", "testdata"]
   exclude_regex = ["_test.go"]
@@ -13,11 +12,8 @@ tmp_dir = "tmp"
   kill_delay = "0s"
   log = "build-errors.log"
   poll = false
-  root = "."
-  build = "go build -o ./tmp/main.exe ."
 
 [color]
-  app = ""
   build = "yellow"
   main = "magenta"
   runner = "green"

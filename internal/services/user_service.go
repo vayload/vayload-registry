@@ -17,7 +17,7 @@ func NewUserService(userRepo domain.UserRepository) *UserService {
 }
 
 func (s *UserService) GetUser(ctx context.Context, id domain.UserID) (*domain.User, error) {
-	return s.userRepo.GetByID(ctx, id)
+	return s.userRepo.FindUserBy(ctx, domain.NewUserFilterBy().WithID(id))
 }
 
 func (s *UserService) UpdateProfile(ctx context.Context, id domain.UserID, usernameStr, email string) error {

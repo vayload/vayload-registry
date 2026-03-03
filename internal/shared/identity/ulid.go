@@ -1,21 +1,39 @@
-package ids
+package identity
 
 import (
+	"crypto/rand"
 	"database/sql/driver"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/oklog/ulid/v2"
 )
 
 type ID ulid.ULID
 
-// New generates a new ULID.
-func New() ID {
-	return ID(ulid.Make())
+var ZeroValue = ID{}
+
+func New() (ID, error) {
+	ms := ulid.Timestamp(time.Now())
+	id, err := ulid.New(ms, rand.Reader)
+	if err != nil {
+		return ID{}, err
+	}
+
+	return ID(id), nil
 }
 
-func ParseID(s string) (ID, error) {
+func MustNew() ID {
+	id, err := New()
+	if err != nil {
+		panic(err)
+	}
+
+	return id
+}
+
+func Parse(s string) (ID, error) {
 	parsed, err := ulid.Parse(s)
 	if err != nil {
 		return ID{}, err
@@ -24,8 +42,8 @@ func ParseID(s string) (ID, error) {
 	return ID(parsed), nil
 }
 
-func MustParseID(s string) ID {
-	id, err := ParseID(s)
+func MustParse(s string) ID {
+	id, err := Parse(s)
 	if err != nil {
 		panic(err)
 	}
@@ -70,7 +88,7 @@ func (id ID) Value() (driver.Value, error) {
 }
 
 func (id ID) IsZero() bool {
-	return id.IsZero()
+	return id == ZeroValue
 }
 
 // Scan implements the sql.Scanner interface for database compatibility.
