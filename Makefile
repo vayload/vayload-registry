@@ -18,6 +18,7 @@ build:
 	@echo "Building $(APP_NAME) for $(GOOS)/$(GOARCH)"
 	GOOS=$(GOOS) GOARCH=$(GOARCH) GOAMD64=$(GOAMD64) \
 	go build $(GOFLAGS) \
+	-tags=r2_storage \
 	-ldflags "$(LDFLAGS)" \
 	-o $(BUILD_DIR)/$(APP_NAME) -v \
 	$(CMD_PATH)
@@ -52,9 +53,11 @@ build-redis-postgres:
 	-o $(BUILD_DIR)/$(APP_NAME)-redis-postgres \
 	$(CMD_PATH)
 
+fmt:
+	go fmt ./...
 
 test:
-	go test ./... -v
+	go test -race ./... -v -short
 
 clean:
 	rm -rf $(BUILD_DIR)

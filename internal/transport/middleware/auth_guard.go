@@ -4,13 +4,15 @@ import (
 	"strings"
 
 	"github.com/vayload/plug-registry/internal/domain"
+	"github.com/vayload/plug-registry/internal/infrastructure/security"
+	"github.com/vayload/plug-registry/internal/services"
 	"github.com/vayload/plug-registry/internal/shared/container"
-	"github.com/vayload/plug-registry/internal/shared/entity"
+	"github.com/vayload/plug-registry/internal/shared/identity"
 	"github.com/vayload/plug-registry/pkg/httpi"
 )
 
 func NewAuthGuard(registry *container.Container) httpi.HttpHandler {
-	jwtManager, err := container.MapTo[domain.TokenManager](registry, "jwtManager")
+	jwtManager, err := container.MapTo[domain.TokenManager](registry, security.JWT_SERVICE_NAME)
 	if err != nil {
 		panic(err)
 	}
@@ -30,7 +32,7 @@ func NewAuthGuard(registry *container.Container) httpi.HttpHandler {
 			return httpi.ErrUnauthorized(nil, "Unauthorized")
 		}
 
-		userID, err := entity.FromString(claims.Sub)
+		userID, err := identity.FromString(claims.Sub)
 		if err != nil {
 			return httpi.ErrUnauthorized(nil, "Unauthorized")
 		}
@@ -38,25 +40,25 @@ func NewAuthGuard(registry *container.Container) httpi.HttpHandler {
 		req.SetAuth(&httpi.HttpAuth{
 			UserId:      domain.UserID{ID: userID},
 			AccessToken: token,
+			AuthType:    httpi.BearerAuth,
 		})
 
-		return nil
+		return req.Next()
 	}
 }
 
 func NewPublishGuard(registry *container.Container) httpi.HttpHandler {
-	jwtManager, err := container.MapTo[domain.TokenManager](registry, "jwt_manager")
+	jwtManager, err := container.MapTo[domain.TokenManager](registry, security.JWT_SERVICE_NAME)
 	if err != nil {
 		panic(err)
 	}
 
-	apiTokenVerifier, err := container.MapTo[domain.ApiTokenVerifier](registry, "api_token_service")
+	apiTokenVerifier, err := container.MapTo[domain.ApiTokenVerifier](registry, services.AUTH_SERVICE_NAME)
 	if err != nil {
 		panic(err)
 	}
 
 	return func(req httpi.HttpRequest, res httpi.HttpResponse) error {
-		// Normal authenticated user
 		rawToken := req.GetHeader("Authorization")
 		if rawToken == "" {
 			rawToken = req.GetCookie(domain.SessionKey)
@@ -67,25 +69,31 @@ func NewPublishGuard(registry *container.Container) httpi.HttpHandler {
 
 		token := strings.TrimPrefix(rawToken, "Bearer ")
 
-		// First check token is api_token
 		if strings.HasPrefix(token, domain.ApiTokenPrefix) {
 			apiToken, err := apiTokenVerifier.VerifyApiToken(req.Context(), token)
 			if err != nil {
 				return httpi.ErrUnauthorized(err, "Unauthorized")
 			}
 
-			req.Locals(httpi.HTTP_API_TOKEN_KEY, apiToken)
+			userId, _ := identity.FromString(apiToken.UserID)
 
-			return nil
+			req.SetAuth(&httpi.HttpAuth{
+				UserId:      domain.UserID{ID: userId},
+				AccessToken: token,
+				AuthType:    httpi.ApiToken,
+				Scope:       apiToken.Scope,
+				Data:        apiToken.PluginID,
+			})
+
+			return req.Next()
 		}
 
-		// Otherwise it is access_token
 		claims, err := jwtManager.Parse(token)
 		if err != nil {
 			return httpi.ErrUnauthorized(err, "Unauthorized")
 		}
 
-		userID, err := entity.FromString(claims.Sub)
+		userID, err := identity.FromString(claims.Sub)
 		if err != nil {
 			return httpi.ErrUnauthorized(err, "Unauthorized")
 		}
@@ -93,8 +101,14 @@ func NewPublishGuard(registry *container.Container) httpi.HttpHandler {
 		req.SetAuth(&httpi.HttpAuth{
 			UserId:      domain.UserID{ID: userID},
 			AccessToken: token,
+			AuthType:    httpi.BearerAuth,
+			// Authenticated user always has global read-write access
+			Scope: domain.KeyScope{
+				Prefix:     "global",
+				Permission: domain.ScopeReadWrite,
+			},
 		})
 
-		return nil
+		return req.Next()
 	}
 }

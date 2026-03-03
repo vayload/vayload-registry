@@ -8,6 +8,7 @@ import (
 
 	"github.com/vayload/plug-registry/config"
 	"github.com/vayload/plug-registry/internal/domain"
+	"github.com/vayload/plug-registry/internal/shared/errors"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/github"
 	"golang.org/x/oauth2/google"
@@ -86,7 +87,7 @@ func NewOAuthStrategy(cfg *config.Config) domain.OAuthStrategy {
 func (s *oauthStrategyFacadeImpl) GetAuthenticationURI(provider domain.OAuthProvider, state domain.OAuthState) (string, error) {
 	c := s.getClient(provider, state.ClientType)
 	if c == nil {
-		return "", domain.NewConflictError("Invalid provider or client type")
+		return "", errors.Conflict("Invalid provider or client type")
 	}
 
 	return c.AuthCodeURL(state.ToBase64()), nil
@@ -95,13 +96,13 @@ func (s *oauthStrategyFacadeImpl) GetAuthenticationURI(provider domain.OAuthProv
 func (s *oauthStrategyFacadeImpl) ExchangeCode(provider domain.OAuthProvider, clientType domain.ClientType, code string) (domain.OAuthUser, error) {
 	c := s.getClient(provider, clientType)
 	if c == nil {
-		return domain.OAuthUser{}, domain.NewConflictError("Invalid provider or client type")
+		return domain.OAuthUser{}, errors.Conflict("Invalid provider or client type")
 	}
 
 	ctx := context.Background()
 	token, err := c.Exchange(ctx, code)
 	if err != nil {
-		return domain.OAuthUser{}, domain.NewUnauthorizedError(fmt.Sprintf("%s exchange failed: %v", provider, err))
+		return domain.OAuthUser{}, errors.Unauthorized(fmt.Sprintf("%s exchange failed", provider)).Cause(err)
 	}
 
 	client := c.Client(ctx, token)
@@ -112,7 +113,7 @@ func (s *oauthStrategyFacadeImpl) ExchangeCode(provider domain.OAuthProvider, cl
 	case domain.OAuthProviderGoogle:
 		return s.fetchGoogleUser(client)
 	default:
-		return domain.OAuthUser{}, domain.NewConflictError("Unsupported provider")
+		return domain.OAuthUser{}, errors.Conflict("Unsupported provider")
 	}
 }
 
@@ -136,13 +137,13 @@ func (s *oauthStrategyFacadeImpl) getClient(provider domain.OAuthProvider, clien
 func (s *oauthStrategyFacadeImpl) fetchGitHubUser(client *http.Client) (domain.OAuthUser, error) {
 	resp, err := client.Get("https://api.github.com/user")
 	if err != nil {
-		return domain.OAuthUser{}, domain.NewInternalError(fmt.Sprintf("Failed to fetch GitHub user: %v", err))
+		return domain.OAuthUser{}, errors.Internal(fmt.Sprintf("Failed to fetch GitHub user: %v", err)).Cause(err)
 	}
 	defer resp.Body.Close()
 
 	var u githubUser
 	if err := json.NewDecoder(resp.Body).Decode(&u); err != nil {
-		return domain.OAuthUser{}, domain.NewInternalError(fmt.Sprintf("Failed to parse GitHub user: %v", err))
+		return domain.OAuthUser{}, errors.Internal(fmt.Sprintf("Failed to parse GitHub user: %v", err)).Cause(err)
 	}
 
 	email := u.Email
@@ -164,7 +165,7 @@ func (s *oauthStrategyFacadeImpl) fetchGitHubUser(client *http.Client) (domain.O
 	}
 
 	if email == "" {
-		return domain.OAuthUser{}, domain.NewUnauthorizedError("GitHub account has no primary verified email")
+		return domain.OAuthUser{}, errors.Unauthorized("GitHub account has no primary verified email")
 	}
 
 	name := u.Name
@@ -186,13 +187,13 @@ func (s *oauthStrategyFacadeImpl) fetchGitHubUser(client *http.Client) (domain.O
 func (s *oauthStrategyFacadeImpl) fetchGoogleUser(client *http.Client) (domain.OAuthUser, error) {
 	resp, err := client.Get("https://www.googleapis.com/oauth2/v3/userinfo")
 	if err != nil {
-		return domain.OAuthUser{}, domain.NewInternalError(fmt.Sprintf("Failed to fetch Google user: %v", err))
+		return domain.OAuthUser{}, errors.Internal("Failed to fetch Google user").Cause(err)
 	}
 	defer resp.Body.Close()
 
 	var u googleUser
 	if err := json.NewDecoder(resp.Body).Decode(&u); err != nil {
-		return domain.OAuthUser{}, domain.NewInternalError(fmt.Sprintf("Failed to parse Google user: %v", err))
+		return domain.OAuthUser{}, errors.Internal("Failed to parse Google user").Cause(err)
 	}
 
 	name := u.Name

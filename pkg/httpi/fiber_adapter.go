@@ -6,13 +6,12 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net/http"
 	"strings"
 
-	"github.com/go-playground/validator/v10"
 	"github.com/gofiber/fiber/v2"
 	"github.com/valyala/fasthttp"
 	"github.com/vayload/plug-registry/internal/domain"
-	"github.com/vayload/plug-registry/pkg/logger"
 )
 
 type httpRequest struct {
@@ -81,7 +80,7 @@ func (request *httpRequest) GetUserAgent() string {
 }
 
 func (request *httpRequest) GetHost() string {
-	return request.Ctx.GetReqHeaders()["Host"][0]
+	return request.Ctx.Hostname()
 }
 
 func (request *httpRequest) ParseBody(any any) error {
@@ -111,36 +110,6 @@ func (request *httpRequest) GetCookie(name string) string {
 
 func (request *httpRequest) Context() context.Context {
 	return request.Ctx.Context()
-}
-
-func (request *httpRequest) Validate(any any) error {
-	if err := validate.Struct(any); err != nil {
-		return ErrValidation(err)
-	}
-	return nil
-}
-
-func (request *httpRequest) ValidateBody(any any) error {
-	if err := request.ParseBody(any); err != nil {
-		logger.E(err, logger.Fields{"context": "ValidateBody", "action": "parse body"})
-		return ErrBadRequest(err)
-	}
-
-	if err := validate.Struct(any); err != nil {
-		logger.E(err, logger.Fields{"context": "ValidateBody", "action": "validation"})
-		if errs, ok := err.(validator.ValidationErrors); ok {
-			fields := make(map[string][]string)
-			for _, e := range errs {
-				fields[e.Field()] = append(fields[e.Field()], e.Tag())
-			}
-
-			return ErrValidation(err, fields)
-		}
-
-		return ErrValidation(err)
-	}
-
-	return nil
 }
 
 func (request *httpRequest) SetAuth(auth *HttpAuth) {
@@ -235,6 +204,16 @@ func (response *httpResponse) Status(status int) HttpResponse {
 	return response
 }
 
+func (response *httpResponse) Ok() HttpResponse {
+	response.ctx.Status(http.StatusOK)
+	return response
+}
+
+func (response *httpResponse) NoContent() error {
+	response.ctx.Status(http.StatusNoContent)
+	return response.ctx.Send(nil)
+}
+
 func (response *httpResponse) Redirect(path string, status int) error {
 	return response.ctx.Redirect(path, status)
 }
@@ -297,15 +276,16 @@ func FiberWrap(handler HttpHandler) fiber.Handler {
 }
 
 func RegisterController(router fiber.Router, c Controller) {
-	group := router.Group(c.Path())
+	routes := c.Routes()
+	group := router.Group(routes.Prefix)
 
-	if len(c.Middlewares()) > 0 {
-		for _, mw := range c.Middlewares() {
+	if len(routes.Middleware) > 0 {
+		for _, mw := range routes.Middleware {
 			group.Use(FiberWrap(mw))
 		}
 	}
 
-	for _, route := range c.Routes() {
+	for _, route := range routes.Routes {
 		handlers := []fiber.Handler{}
 		if len(route.Middleware) > 0 {
 			for _, mw := range route.Middleware {
@@ -320,7 +300,8 @@ func RegisterController(router fiber.Router, c Controller) {
 		}
 
 		group.Add(string(route.Method), routePath, handlers...)
-		LogRegisteredRoute(string(route.Method), fmt.Sprintf("%s/%s", c.Path(), strings.TrimLeft(route.Path, "/")))
+
+		LogRegisteredRoute(string(route.Method), fmt.Sprintf("%s/%s", routes.Prefix, strings.TrimLeft(route.Path, "/")))
 	}
 }
 

@@ -5,21 +5,21 @@ import (
 	"database/sql"
 	"time"
 
-	"github.com/jmoiron/sqlx"
 	"github.com/vayload/plug-registry/internal/domain"
+	"github.com/vayload/plug-registry/internal/infrastructure/database"
 )
 
 type apiTokenRepository struct {
-	db *sqlx.DB
+	db database.Queryer
 }
 
-func NewApiTokenRepository(db *sqlx.DB) domain.ApiTokenRepository {
+func NewApiTokenRepository(db database.Queryer) domain.ApiTokenRepository {
 	return &apiTokenRepository{db: db}
 }
 
 func (r *apiTokenRepository) Create(ctx context.Context, apiToken domain.ApiToken) (domain.ApiToken, error) {
-	query := `INSERT INTO api_tokens (id, user_id, key_hash, key_name, key_scope, created_at, expires_at, last_used_at, revoked_at)
-	          VALUES (:id, :user_id, :key_hash, :key_name, :key_scope, :created_at, :expires_at, :last_used_at, :revoked_at)`
+	query := `INSERT INTO api_tokens (id, user_id, key_hash, plugin_id, key_mask, name, scope, description, created_at)
+	          VALUES (:id, :user_id, :key_hash, :plugin_id, :key_mask, :name, :scope, :description, :created_at)`
 
 	model := NewApiTokenModel(&apiToken)
 

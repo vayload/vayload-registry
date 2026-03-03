@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/pelletier/go-toml/v2"
@@ -15,6 +16,10 @@ type Config struct {
 	Database DatabaseConfig `toml:"database"`
 	OAuth    OAuthConfig    `toml:"oauth"`
 	Storage  StorageConfig  `toml:"storage"`
+	Email    EmailConfig    `toml:"email"`
+
+	WorkDir string `toml:"-"`
+	DataDir string `toml:"-"`
 }
 
 type ServerConfig struct {
@@ -23,6 +28,7 @@ type ServerConfig struct {
 	CookieDomain   string   `toml:"cookie_domain"`
 	AllowOrigins   []string `toml:"origins"`
 	TrustedProxies []string `toml:"trusted_proxies"`
+	LogLevel       string   `toml:"log_level"`
 }
 
 type SecurityConfig struct {
@@ -54,8 +60,22 @@ type OauthProviderConfig struct {
 }
 
 type StorageConfig struct {
-	Provider string `toml:"provider"`
-	LocalDir string `toml:"local_dir"`
+	BucketName     string `toml:"bucket_name"`
+	LocalDir       string `toml:"local_dir"`
+	LocalEndpoint  string `toml:"local_endpoint"`
+	LocalSecret    string `toml:"local_secret"`
+	LocalSecretKey []byte `toml:"-"`
+
+	// Credentials for R2 storage
+	R2Endpoint  string `toml:"r2_endpoint"`
+	R2AccessKey string `toml:"r2_access_key"`
+	R2SecretKey string `toml:"r2_secret_key"`
+}
+
+type EmailConfig struct {
+	ResendAPIKey string `toml:"api_key"`
+	FromEmail    string `toml:"email_from"`
+	AppBaseURL   string `toml:"app_base_url"`
 }
 
 type CacheConfig struct {
@@ -92,16 +112,34 @@ func LoadConfig(path string) (*Config, error) {
 		cfg.Security.JwtPrivateKey = keyBytes
 	}
 
+	if cfg.Database.Token != "" {
+		cfg.Database.URL = fmt.Sprintf("%s?authToken=%s", cfg.Database.URL, cfg.Database.Token)
+	}
+
+	cfg.Storage.LocalSecretKey = []byte(cfg.Storage.LocalSecret)
+
 	return &cfg, nil
 }
 
-var once sync.Once
-var config *Config
+var (
+	configOnce sync.Once
+	config     *Config
+)
 
 func GetConfig(path string) (*Config, error) {
 	var err error
-	once.Do(func() {
-		config, err = LoadConfig(path)
+	configOnce.Do(func() {
+		workdir := os.Getenv("WORKDIR")
+		if workdir == "" {
+			workdir = "."
+		}
+		config, err = LoadConfig(filepath.Join(workdir, path))
+		if err != nil {
+			return
+		}
+
+		config.WorkDir = workdir
+		config.DataDir = filepath.Join(workdir, "data")
 	})
 
 	return config, err

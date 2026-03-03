@@ -29,10 +29,20 @@ const (
 	HEAD    HttpMethod = "HEAD"
 )
 
+type AuthType string
+
+const (
+	BearerAuth AuthType = "bearer"
+	ApiToken   AuthType = "api_token"
+)
+
 type HttpAuth struct {
-	UserId      domain.UserID `json:"user_id"`
-	Role        string        `json:"role"`
-	AccessToken string        `json:"access_token,omitempty"` // Optional access token for the user
+	UserId      domain.UserID   `json:"user_id"`
+	Role        string          `json:"role"`
+	Scope       domain.KeyScope `json:"scope"`
+	AccessToken string          `json:"access_token,omitempty"`
+	AuthType    AuthType        `json:"auth_type,omitempty"`
+	Data        any             `json:"-"`
 }
 
 type HttpHandler func(req HttpRequest, res HttpResponse) error
@@ -45,10 +55,14 @@ type HttpRoute struct {
 	Public         bool   // Indicates if the route is public
 }
 
+type HttpRoutesGroup struct {
+	Prefix     string        // prefix for all routes in this group
+	Middleware []HttpHandler // middleware for all routes in this group
+	Routes     []HttpRoute
+}
+
 type Controller interface {
-	Routes() []HttpRoute
-	Middlewares() []HttpHandler
-	Path() string
+	Routes() *HttpRoutesGroup
 }
 
 type Cookie struct {
@@ -90,8 +104,6 @@ type HttpRequest interface {
 	Locals(key string, value any) any
 	GetLocal(key string) any
 	Next() error
-	Validate(any) error     // Validate the request body using a validator
-	ValidateBody(any) error // Parse and validate the request body
 	FiberCtx() *fiber.Ctx
 }
 
@@ -104,6 +116,8 @@ type HttpResponse interface {
 	File(path string) error
 	Stream(stream io.Reader) error
 	Status(status int) HttpResponse
+	Ok() HttpResponse
+	NoContent() error
 	Redirect(path string, status int) error
 	SetBodyStreamWriter(writer StreamWriter) error
 	Cookie(cookie *Cookie) HttpResponse

@@ -2,8 +2,11 @@ package domain
 
 import (
 	"context"
+	"crypto/sha256"
 	"io"
 	"time"
+
+	"github.com/vayload/plug-registry/internal/shared/errors"
 )
 
 type PluginId string
@@ -16,11 +19,11 @@ type PluginName string
 
 func NewPluginName(name string) (PluginName, error) {
 	if name == "" {
-		return "", NewValidationError("Plugin name cannot be empty")
+		return "", errors.Validation("Plugin name cannot be empty")
 	}
 	for _, c := range name {
 		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '@') {
-			return "", NewValidationError("Plugin name can only contain alphanumeric characters and hyphens")
+			return "", errors.Validation("Plugin name can only contain alphanumeric characters and hyphens")
 		}
 	}
 	return PluginName(name), nil
@@ -57,7 +60,7 @@ func ParsePluginStatus(s string) (PluginStatus, error) {
 	case "yanked":
 		return PluginStatusYanked, nil
 	default:
-		return "", NewValidationError("Invalid plugin status")
+		return "", errors.Validation("Invalid plugin status")
 	}
 }
 
@@ -95,7 +98,7 @@ func ParsePluginVisibility(s string) (PluginVisibility, error) {
 	case "private":
 		return PluginVisibilityPrivate, nil
 	default:
-		return "", NewValidationError("Invalid plugin visibility")
+		return "", errors.Validation("Invalid plugin visibility")
 	}
 }
 
@@ -107,15 +110,16 @@ type PluginOwner struct {
 type Plugin struct {
 	ID                  PluginId         `json:"id"`
 	Name                PluginName       `json:"name"`
+	Namespace           string           `json:"namespace"`
 	Owner               PluginOwner      `json:"owner"`
 	DisplayName         string           `json:"display_name"`
 	Description         *string          `json:"description,omitempty"`
 	HomepageURL         *string          `json:"homepage_url,omitempty"`
 	RepoURL             *string          `json:"repo_url,omitempty"`
 	DocumentationURL    *string          `json:"documentation_url,omitempty"`
-	Readme              *string          `json:"readme,omitempty"`
-	License             *string          `json:"license,omitempty"`
-	LicenseType         *string          `json:"license_type,omitempty"`
+	Readme              *string          `json:"readme,omitempty"`       // Latest readme content
+	License             *string          `json:"license,omitempty"`      // latest license content
+	LicenseType         *string          `json:"license_type,omitempty"` // latest license type
 	Visibility          PluginVisibility `json:"visibility"`
 	Status              PluginStatus     `json:"status"`
 	PricingType         string           `json:"pricing_type"`
@@ -144,8 +148,6 @@ func NewPlugin(
 	homepageURL *string,
 	repoURL *string,
 	documentationURL *string,
-	readme *string,
-	license *string,
 	visibility PluginVisibility,
 	tags []string,
 ) *Plugin {
@@ -153,14 +155,13 @@ func NewPlugin(
 	return &Plugin{
 		ID:               id,
 		Name:             name,
+		Namespace:        name.String(),
 		Owner:            owner,
 		DisplayName:      name.String(), // Default
 		Description:      description,
 		HomepageURL:      homepageURL,
 		RepoURL:          repoURL,
 		DocumentationURL: documentationURL,
-		Readme:           readme,
-		License:          license,
 		Visibility:       visibility,
 		Status:           PluginStatusDraft,
 		PricingType:      "free",
@@ -169,12 +170,6 @@ func NewPlugin(
 		CreatedAt:        now,
 		UpdatedAt:        now,
 	}
-}
-
-type StorageProvider interface {
-	Upload(ctx context.Context, name, version string, data io.Reader) (string, int64, string, error)
-	GetSignedURL(ctx context.Context, key string) (string, error)
-	Fetch(ctx context.Context, name, version string) (io.ReadCloser, error)
 }
 
 type PluginVersionStatus string
@@ -197,15 +192,16 @@ type PluginVersion struct {
 	PublishedAt    time.Time
 	Yanked         bool
 	YankReason     *string
-	ManifestJSON   string
-	SHA256         string
+	ManifestObject string
+	ReadmeObject   *string
+	LicenseObject  *string
+	LicenseType    *string
+	Integrity      [32]byte
 	Filename       string
 	Status         PluginVersionStatus
 	SizeBytes      uint64
 	TotalFiles     int32
 	DownloadsCount uint32
-	MinAppVersion  *string
-	MaxAppVersion  *string
 	Changelog      *string
 }
 
@@ -213,12 +209,10 @@ func NewPluginVersion(
 	id string,
 	pluginID PluginId,
 	version string,
-	manifest string,
-	sha256 string,
+	integrity [32]byte,
 	filename string,
 	size uint64,
 	totalFiles int32,
-	minApp, maxApp, changelog *string,
 ) PluginVersion {
 	return PluginVersion{
 		ID:             id,
@@ -226,15 +220,11 @@ func NewPluginVersion(
 		Version:        version,
 		PublishedAt:    time.Now().UTC(),
 		Status:         PluginVersionStatusStable,
-		ManifestJSON:   manifest,
-		SHA256:         sha256,
+		Integrity:      integrity,
 		Filename:       filename,
 		SizeBytes:      size,
 		TotalFiles:     totalFiles,
 		DownloadsCount: 0,
-		MinAppVersion:  minApp,
-		MaxAppVersion:  maxApp,
-		Changelog:      changelog,
 	}
 }
 
@@ -267,6 +257,60 @@ type PluginFilter struct {
 	Offset     uint32
 }
 
+type FindTypes uint8
+
+const (
+	FindTypeByName FindTypes = iota
+	FindTypeByVersion
+	FindTypeByCategory
+	FindTypeByPluginType
+	FindTypeByOwnerId
+	FindTypeByStatus
+)
+
+type PluginFindBy struct {
+	ID      *string
+	Version *string
+	Name    *string
+	OwnerID *string
+	Status  *string
+
+	Limit  uint32
+	Offset uint32
+}
+
+func NewPluginFindBy() *PluginFindBy {
+	return &PluginFindBy{
+		Limit:  10,
+		Offset: 0,
+	}
+}
+
+func (f *PluginFindBy) WithID(id string) *PluginFindBy {
+	f.ID = &id
+	return f
+}
+
+func (f *PluginFindBy) WithVersion(version string) *PluginFindBy {
+	f.Version = &version
+	return f
+}
+
+func (f *PluginFindBy) WithName(name string) *PluginFindBy {
+	f.Name = &name
+	return f
+}
+
+func (f *PluginFindBy) WithOwnerID(ownerID string) *PluginFindBy {
+	f.OwnerID = &ownerID
+	return f
+}
+
+func (f *PluginFindBy) WithStatus(status string) *PluginFindBy {
+	f.Status = &status
+	return f
+}
+
 type PluginTaskStatus string
 
 const (
@@ -291,12 +335,43 @@ type PluginTask struct {
 	UpdatedAt time.Time        `json:"updated_at"`
 }
 
+func NewPluginTask(ID string, pluginID PluginId, version, userID string) *PluginTask {
+	return &PluginTask{
+		ID:        ID,
+		PluginID:  pluginID,
+		Version:   version,
+		UserID:    userID,
+		Status:    PluginTaskStatusPending,
+		Metadata:  "",
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+}
+
+func (t *PluginTask) UpdateStatus(status PluginTaskStatus, errMsg *string) {
+	t.Status = status
+	t.Error = errMsg
+	t.UpdatedAt = time.Now().UTC()
+}
+
+func (t *PluginTask) UpdateMetadata(metadata string) {
+	t.Metadata = metadata
+	t.UpdatedAt = time.Now().UTC()
+}
+
+type IPluginStorage interface {
+	Put(ctx context.Context, key string, mimeType string, r io.Reader) error
+	Get(ctx context.Context, key string) (io.ReadCloser, error)
+	GetSignedURL(ctx context.Context, key string) (string, error)
+	Delete(ctx context.Context, key string) error
+}
+
 type PluginRepository interface {
-	Create(ctx context.Context, plugin Plugin) (Plugin, error)
-	GetByID(ctx context.Context, id PluginId) (*Plugin, error)
-	GetByName(ctx context.Context, name PluginName) (*Plugin, error)
-	GetByNameAndVersion(ctx context.Context, name PluginName, version string) (*Plugin, error)
-	HasVersionUploaded(ctx context.Context, name PluginName, version string) (bool, error)
+	CreatePlugin(ctx context.Context, plugin Plugin) (Plugin, error)
+	FindPluginSummary(ctx context.Context, filters PluginFindBy) (*Plugin, error)
+	FindPluginDetails(ctx context.Context, filters PluginFindBy) (*Plugin, error)
+	HasMatchingPlugin(ctx context.Context, filters PluginFindBy) (bool, error)
+
 	ListByOwner(ctx context.Context, ownerID string) ([]Plugin, error)
 	UpdateStatus(ctx context.Context, id PluginId, status PluginStatus) error
 	Delete(ctx context.Context, id PluginId) error
@@ -307,8 +382,40 @@ type PluginRepository interface {
 	UpdateDownloads(ctx context.Context, pluginID PluginId, version string, downloads uint32) error
 	UpdateLatestVersions(ctx context.Context, pluginID PluginId, latestVersions string) error
 
+	// Stats
+	GetAggregatedStats(ctx context.Context, ownerID string) (totalPlugins, totalDownloads, totalVersions int, err error)
+	GetLatestAuditLogs(ctx context.Context, userID string, limit int) ([]AuditLog, error)
+
 	// Task management
 	CreateTask(ctx context.Context, task PluginTask) error
 	UpdateTaskStatus(ctx context.Context, taskID string, status PluginTaskStatus, errMsg *string) error
 	GetTask(ctx context.Context, taskID string) (*PluginTask, error)
+}
+
+type ObjectRepository interface {
+	// Insert or create object in object_storage
+	UpsertObjects(ctx context.Context, objects []BlobObject) error
+}
+
+type BlobObject struct {
+	ObjectHash string // SHA256 hash
+	Type       string // 'tarball', 'manifest', 'readme', 'license', etc.
+	SizeBytes  int64
+	MimeType   string // 'application/json', 'text/markdown', 'application/gzip'
+	Blob       []byte // bynary content
+	CreatedAt  time.Time
+}
+
+func NewBlobObject(ID string, rtype string, blobType string, blob []byte) *BlobObject {
+	hasher := sha256.New()
+	hasher.Write(blob)
+
+	return &BlobObject{
+		ObjectHash: ID,
+		Type:       rtype,
+		SizeBytes:  int64(len(blob)),
+		MimeType:   blobType,
+		Blob:       blob,
+		CreatedAt:  time.Now().UTC(),
+	}
 }

@@ -1,0 +1,12 @@
+{
+	"lsp": {
+		"gopls": {
+			"settings": {
+				"build.buildTags": [
+					"-tags=cache_redis",
+					"-tags=r2_storage"
+				]
+			}
+		}
+	}
+}

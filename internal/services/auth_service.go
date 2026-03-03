@@ -10,49 +10,67 @@ import (
 
 	"github.com/vayload/plug-registry/internal/domain"
 	"github.com/vayload/plug-registry/internal/infrastructure/security"
-	"github.com/vayload/plug-registry/internal/shared/entity"
-	"github.com/vayload/plug-registry/pkg/ids"
+	"github.com/vayload/plug-registry/internal/shared/errors"
+	"github.com/vayload/plug-registry/internal/shared/identity"
+	"github.com/vayload/plug-registry/pkg/crypto"
+	"github.com/vayload/plug-registry/pkg/logger"
+	"github.com/vayload/plug-registry/pkg/queue"
 )
 
+const AUTH_SERVICE_NAME = "auth_service"
+
+type TransportMeta struct {
+	UserAgent string
+	IPAddress string
+}
+
 type AuthService struct {
-	repository    domain.UserRepository
-	tokenRepo     domain.ApiTokenRepository
-	hashing       domain.HashingStrategy
-	oauthStrategy domain.OAuthStrategy
-	jwtManager    domain.TokenManager
+	userRespository domain.UserRepository
+	tokenRepository domain.ApiTokenRepository
+	hashing         domain.HashingStrategy
+	oauthStrategy   domain.OAuthStrategy
+	jwtManager      domain.TokenManager
+	verifier        *security.VerificationTokenManager
+	producer        queue.Producer
 }
 
 func NewAuthService(
-	repository domain.UserRepository,
-	tokenRepo domain.ApiTokenRepository,
+	userRespository domain.UserRepository,
+	tokenRepository domain.ApiTokenRepository,
 	hashing domain.HashingStrategy,
 	oauthStrategy domain.OAuthStrategy,
 	jwtManager domain.TokenManager,
+	verifier *security.VerificationTokenManager,
+	producer queue.Producer,
 ) *AuthService {
-	return &AuthService{
-		repository:    repository,
-		tokenRepo:     tokenRepo,
-		hashing:       hashing,
-		oauthStrategy: oauthStrategy,
-		jwtManager:    jwtManager,
+	service := &AuthService{
+		userRespository: userRespository,
+		tokenRepository: tokenRepository,
+		hashing:         hashing,
+		oauthStrategy:   oauthStrategy,
+		jwtManager:      jwtManager,
+		verifier:        verifier,
+		producer:        producer,
 	}
+
+	return service
 }
 
-func (s *AuthService) Register(ctx context.Context, username domain.Username, email domain.Email, password domain.PasswordHash) (*domain.User, *domain.AuthToken, error) {
+func (service *AuthService) Register(ctx context.Context, username domain.Username, email domain.Email, password domain.PasswordHash, meta TransportMeta) error {
 	// Check if already exists
-	existing, _ := s.repository.GetByEmail(ctx, email.String())
+	existing, _ := service.userRespository.FindUserBy(ctx, domain.UserFilterBy{Email: &email})
 	if existing != nil {
-		return nil, nil, domain.NewAlreadyExistsError("Email already registered")
+		return errors.AlreadyExists("Email already registered")
 	}
 
-	existingUser, _ := s.repository.GetByUsername(ctx, username.String())
+	existingUser, _ := service.userRespository.FindUserBy(ctx, domain.UserFilterBy{Username: &username})
 	if existingUser != nil {
-		return nil, nil, domain.NewAlreadyExistsError("Username already taken")
+		return errors.AlreadyExists("Username already taken")
 	}
 
-	pwdHash, err := s.hashing.Hash(password.String())
+	pwdHash, err := service.hashing.Hash(password.String())
 	if err != nil {
-		return nil, nil, err
+		return errors.Internal("Failed to hash password").Cause(err)
 	}
 
 	userID := domain.NewUserID()
@@ -60,87 +78,171 @@ func (s *AuthService) Register(ctx context.Context, username domain.Username, em
 		userID,
 		username,
 		email,
-		nil,
 		domain.AuthProviderPassword,
 		userID.String(),
-		nil,
 	)
-	var ph = domain.PasswordHash(pwdHash)
-	user.PasswordHash = &ph
+	user.SetPassword(domain.PasswordHash(pwdHash))
 
-	createdUser, err := s.repository.Create(ctx, *user)
+	expiration := time.Now().Add(time.Minute * 15)
+	unverifiedToken := domain.UnverifiedToken{
+		Token: service.verifier.Generate(userID.String(), expiration),
+		Exp:   time.Duration(expiration.Minute()),
+	}
+
+	createdUser, err := service.userRespository.CreateUnverifiedUser(ctx, *user, unverifiedToken)
 	if err != nil {
-		return nil, nil, err
+		return errors.Internal("Failed to create unverified user").Cause(err)
 	}
 	createdUser.UnsetPassword()
 
-	token, err := s.jwtManager.Sign(domain.TokenPayload{
-		UserID: userID.String(),
-		Email:  email.String(),
-		Role:   createdUser.Role.String(),
-	})
-	if err != nil {
-		return nil, nil, err
-	}
+	go func() {
+		job := queue.NewJob(crypto.GenerateNanoID(), queue.JobTypeEmailVerification, map[string]any{
+			"email":    email.String(),
+			"username": username.String(),
+			"token":    unverifiedToken.Token,
+		})
 
-	if err := s.saveRefreshToken(ctx, userID, token); err != nil {
-		return nil, nil, err
-	}
+		if err := service.producer.Publish(context.Background(), job); err != nil {
+			logger.E(err, logger.Fields{"msg": "Failed to publish email verification job", "email": email.String(), "job": job})
+		}
+	}()
 
-	return &createdUser, &token, nil
+	return nil
 }
 
-func (s *AuthService) Login(ctx context.Context, emailStr, password string) (*domain.User, *domain.AuthToken, error) {
-	user, err := s.repository.GetByEmail(ctx, emailStr)
+func (service *AuthService) SendVerificationEmail(ctx context.Context, userID domain.UserID) error {
+	user, err := service.userRespository.FindUserBy(ctx, domain.UserFilterBy{ID: &userID})
 	if err != nil || user == nil {
-		return nil, nil, domain.NewUnauthorizedError("Invalid credentials")
+		return errors.NotFound("User not found")
 	}
 
-	if user.PasswordHash == nil || !s.hashing.Verify(password, user.PasswordHash.String()) {
-		return nil, nil, domain.NewUnauthorizedError("Invalid credentials")
+	if user.EmailVerified {
+		return errors.Validation("Email already verified")
+	}
+
+	expiresAt := time.Now().UTC().Add(24 * time.Hour)
+	token := service.verifier.Generate(userID.String(), expiresAt)
+
+	go func() {
+		job := queue.NewJob(crypto.GenerateNanoID(), queue.JobTypeEmailVerification, map[string]any{
+			"email":    user.Email.String(),
+			"username": user.Username.String(),
+			"token":    token,
+		})
+
+		if err := service.producer.Publish(context.Background(), job); err != nil {
+			logger.E(err, logger.Fields{"msg": "Failed to publish email verification job", "email": user.Email.String(), "job": job})
+		}
+	}()
+
+	return nil
+}
+
+func (service *AuthService) VerifyEmailAndLogin(ctx context.Context, rawToken string) (*domain.User, *domain.AuthToken, error) {
+	userIDStr, err := service.verifier.Validate(rawToken)
+	if err != nil {
+		return nil, nil, errors.Unauthorized("Invalid or expired verification token").Cause(err)
+	}
+
+	rawID, err := identity.FromString(userIDStr)
+	if err != nil {
+		return nil, nil, errors.Unauthorized("Invalid or malformed token").Cause(err)
+	}
+
+	userID := domain.UserID{ID: rawID}
+
+	user, err := service.userRespository.FindByVerificationToken(ctx, userID, rawToken)
+	if err != nil || user == nil {
+		return nil, nil, errors.NotFound("User not found or token mismatch").Cause(err)
+	}
+
+	if user.EmailVerified {
+		return nil, nil, errors.Conflict("Email already verified")
+	}
+
+	if err := service.userRespository.MarkEmailVerified(ctx, domain.UserID{ID: rawID}); err != nil {
+		return nil, nil, errors.Internal("Failed to mark email verified").Cause(err)
+	}
+
+	token, err := service.jwtManager.Sign(domain.TokenPayload{
+		UserID: userID.String(),
+		Email:  user.Email.String(),
+		Role:   string(user.Role),
+	})
+	if err != nil {
+		return nil, nil, errors.Internal("Failed to generate token").Cause(err)
+	}
+
+	return user, &token, nil
+}
+
+func (service *AuthService) LoginWithPassword(ctx context.Context, emailStr, password string, meta TransportMeta) (*domain.User, *domain.AuthToken, error) {
+	user, err := service.userRespository.FindUserBy(ctx, domain.NewUserFilterBy().WithEmail(domain.Email(emailStr)))
+	if err != nil || user == nil {
+		return nil, nil, errors.Unauthorized("Invalid credentials").Cause(err)
+	}
+
+	// If user is using OAuth, use it again
+	if user.Provider != domain.AuthProviderPassword {
+		return nil, nil, errors.Unauthorized("You are using OAuth to login, use it again")
+	}
+
+	if user.PasswordHash == nil || !service.hashing.Verify(password, user.PasswordHash.String()) {
+		return nil, nil, errors.Unauthorized("Invalid credentials")
 	}
 
 	user.UnsetPassword()
-	token, err := s.jwtManager.Sign(domain.TokenPayload{
+	token, err := service.jwtManager.Sign(domain.TokenPayload{
 		UserID: user.ID.String(),
 		Email:  user.Email.String(),
 		Role:   string(user.Role),
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, errors.Internal("Failed to generate token").Cause(err)
 	}
 
-	if err := s.saveRefreshToken(ctx, user.ID, token); err != nil {
-		return nil, nil, err
+	if err := service.storeRefreshToken(ctx, user.ID, token, meta); err != nil {
+		return nil, nil, errors.Internal("Failed to store refresh token").Cause(err)
 	}
 
-	_ = s.repository.UpdateLastLogin(ctx, user.ID, time.Now().UTC())
+	// This case only log, because it's not critical
+	if err := service.userRespository.UpdateLastLogin(ctx, user.ID, time.Now().UTC()); err != nil {
+		logger.E(err, logger.Fields{"msg": "Failed to update last login", "user_id": user.ID.String()})
+	}
 
 	return user, &token, nil
 }
 
-func (s *AuthService) GetOAuthAuthenticationURI(ctx context.Context, provider domain.OAuthProvider, state domain.OAuthState) (string, error) {
-	return s.oauthStrategy.GetAuthenticationURI(provider, state)
+type OauthInput struct {
+	Provider domain.OAuthProvider
+	State    domain.OAuthState
+	Code     string // when need for exchange code
 }
 
-func (s *AuthService) LoginWithOAuth(ctx context.Context, provider domain.OAuthProvider, code string, state domain.OAuthState) (*domain.User, *domain.AuthToken, error) {
-	oauthUser, err := s.oauthStrategy.ExchangeCode(provider, state.ClientType, code)
+func (service *AuthService) GetOAuthAuthenticationURI(ctx context.Context, input OauthInput) (string, error) {
+	return service.oauthStrategy.GetAuthenticationURI(input.Provider, input.State)
+}
+
+func (service *AuthService) LoginWithOAuth(ctx context.Context, input OauthInput, meta TransportMeta) (*domain.User, *domain.AuthToken, error) {
+	oauthUser, err := service.oauthStrategy.ExchangeCode(input.Provider, input.State.ClientType, input.Code)
+
 	if err != nil {
 		return nil, nil, err
 	}
 
-	authProvider, err := domain.ParseAuthProvider(string(provider))
+	authProvider, err := domain.ParseAuthProvider(string(input.Provider))
 	if err != nil {
 		return nil, nil, err
 	}
 
-	user, _ := s.repository.GetByProvider(ctx, authProvider, oauthUser.SID)
-	if user == nil {
-		user, _ = s.repository.GetByEmail(ctx, oauthUser.Email)
+	user, err := service.userRespository.FindUserBy(ctx, domain.NewUserFilterBy().WithEmail(domain.Email(oauthUser.Email)))
+	if err != nil {
+		return nil, nil, err
 	}
 
+	// When user not exists, create
+	isNewUser := user == nil
 	if user == nil {
-		// Create new user
 		userID := domain.NewUserID()
 		email, _ := domain.NewEmail(oauthUser.Email)
 		username, _ := domain.NewUsername(strings.ToLower(strings.ReplaceAll(oauthUser.Name, " ", "_")))
@@ -150,12 +252,15 @@ func (s *AuthService) LoginWithOAuth(ctx context.Context, provider domain.OAuthP
 			userID,
 			username,
 			email,
-			&oauthUser.AvatarURL,
 			authProvider,
 			oauthUser.SID,
-			&now,
 		)
-		created, err := s.repository.Create(ctx, *user)
+		if oauthUser.AvatarURL != "" {
+			user.SetAvatarURL(&oauthUser.AvatarURL)
+		}
+		user.SetVerifiedAt(&now)
+
+		created, err := service.userRespository.Create(ctx, *user)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -163,7 +268,7 @@ func (s *AuthService) LoginWithOAuth(ctx context.Context, provider domain.OAuthP
 	}
 
 	user.UnsetPassword()
-	token, err := s.jwtManager.Sign(domain.TokenPayload{
+	token, err := service.jwtManager.Sign(domain.TokenPayload{
 		UserID: user.ID.String(),
 		Email:  user.Email.String(),
 		Role:   string(user.Role),
@@ -172,47 +277,76 @@ func (s *AuthService) LoginWithOAuth(ctx context.Context, provider domain.OAuthP
 		return nil, nil, err
 	}
 
-	if err := s.saveRefreshToken(ctx, user.ID, token); err != nil {
+	if err := service.storeRefreshToken(ctx, user.ID, token, meta); err != nil {
 		return nil, nil, err
+	}
+
+	// If user is new, send welcome email
+	if isNewUser {
+		job := queue.NewJob(crypto.GenerateNanoID(), queue.JobTypeEmailWelcome, map[string]any{
+			"email":    user.Email.String(),
+			"username": user.Username.String(),
+		})
+
+		if err := service.producer.Publish(context.Background(), job); err != nil {
+			logger.E(err, logger.Fields{"msg": "Failed to publish email welcome job", "user_id": user.ID.String()})
+		}
 	}
 
 	return user, &token, nil
 }
 
-func (s *AuthService) RefreshToken(ctx context.Context, refreshTokenStr string) (*domain.AuthToken, error) {
-	bytes, err := base64.RawURLEncoding.DecodeString(refreshTokenStr)
+type RefreshTokenOutput struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	TokenType    string `json:"token_type"`
+	ExpiresIn    int    `json:"expires_in"`
+
+	Token domain.AuthToken `json:"-"`
+}
+
+func (service *AuthService) RefreshToken(ctx context.Context, token string, meta TransportMeta) (*RefreshTokenOutput, error) {
+	bytes, err := base64.RawURLEncoding.DecodeString(token)
 	if err != nil {
-		return nil, domain.NewUnauthorizedError("Invalid refresh token")
+		return nil, errors.Unauthorized("Invalid refresh token").Cause(err)
 	}
+
+	// Hasing for search in database the hash
 	hasher := sha256.New()
 	hasher.Write(bytes)
 	tokenHash := fmt.Sprintf("%x", hasher.Sum(nil))
 
-	storedToken, err := s.repository.FindRefreshTokenByHash(ctx, tokenHash)
+	storedToken, err := service.userRespository.FindRefreshTokenByHash(ctx, tokenHash)
 	if err != nil || storedToken == nil {
-		return nil, domain.NewUnauthorizedError("Refresh token not found")
+		return nil, errors.Unauthorized("Refresh token not found").Cause(err)
 	}
 
-	if storedToken.IsRevoked() || storedToken.IsExpired() {
-		return nil, domain.NewUnauthorizedError("Expired or revoked token")
+	if storedToken.IsUsed() {
+		service.userRespository.RevokeRefreshTokenFamily(ctx, storedToken.FamilyID, "reuse_detected")
+		return nil, errors.Unauthorized("this token is comprom").Cause(err)
 	}
 
-	rawUserID, err := entity.FromString(storedToken.UserID)
+	if !storedToken.IsValid() {
+		return nil, errors.Unauthorized("Expired or revoked token").Cause(err)
+	}
+
+	rawUserID, err := identity.FromString(storedToken.UserID)
 	if err != nil {
-		return nil, domain.NewUnauthorizedError("Invalid refresh token")
+		return nil, errors.Unauthorized("Invalid refresh token").Cause(err)
 	}
 
 	userID := domain.UserID{ID: rawUserID}
-	user, err := s.repository.GetByID(ctx, userID)
+	user, err := service.userRespository.FindUserBy(ctx, domain.UserFilterBy{ID: &userID})
 	if err != nil || user == nil {
-		return nil, domain.NewNotFoundError("User not found")
+		return nil, errors.NotFound("User not found").Cause(err)
 	}
 
-	if err := s.repository.RemoveRefreshToken(ctx, userID, storedToken.TokenHash); err != nil {
+	// Mark token as used
+	if err := service.userRespository.MarkRefreshTokenUsed(ctx, storedToken.ID); err != nil {
 		return nil, err
 	}
 
-	newToken, err := s.jwtManager.Sign(domain.TokenPayload{
+	newToken, err := service.jwtManager.Sign(domain.TokenPayload{
 		UserID: userID.String(),
 		Email:  user.Email.String(),
 		Role:   string(user.Role),
@@ -221,36 +355,60 @@ func (s *AuthService) RefreshToken(ctx context.Context, refreshTokenStr string) 
 		return nil, err
 	}
 
-	if err := s.saveRefreshToken(ctx, userID, newToken); err != nil {
+	// Create new refresh token
+	expiresAt := time.Now().UTC().Add(time.Duration(newToken.RefreshTokenExpiresIn) * time.Second)
+	refreshToken := domain.NewRotatedRefreshToken(
+		identity.MustNew().String(),
+		userID.String(),
+		newToken.RefreshTokenHash,
+		storedToken.FamilyID,
+		storedToken.ID,
+		expiresAt,
+		&meta.UserAgent,
+		&meta.IPAddress,
+	)
+
+	if err := service.userRespository.CreateRefreshToken(ctx, &refreshToken); err != nil {
 		return nil, err
 	}
 
-	return &newToken, nil
+	return &RefreshTokenOutput{
+		AccessToken:  newToken.AccessToken,
+		RefreshToken: newToken.RefreshToken,
+		TokenType:    "Bearer ",
+		ExpiresIn:    newToken.ExpiresAt.Second(),
+		Token:        newToken,
+	}, nil
 }
 
-func (s *AuthService) saveRefreshToken(ctx context.Context, userID domain.UserID, token domain.AuthToken) error {
+// Create token, generate when user is logged in
+func (service *AuthService) storeRefreshToken(ctx context.Context, userID domain.UserID, token domain.AuthToken, meta TransportMeta) error {
 	expiresAt := time.Now().UTC().Add(time.Duration(token.RefreshTokenExpiresIn) * time.Second)
 	refreshToken := domain.NewRefreshToken(
-		ids.New().String(),
+		identity.MustNew().String(),
 		userID.String(),
 		token.RefreshTokenHash,
-		&expiresAt,
+		identity.MustNew().String(),
+		expiresAt,
+		&meta.UserAgent,
+		&meta.IPAddress,
 	)
-	return s.repository.UpsertRefreshToken(ctx, userID, &refreshToken)
+
+	return service.userRespository.CreateRefreshToken(ctx, &refreshToken)
 }
 
-func (s *AuthService) Logout(ctx context.Context, userID domain.UserID) error {
-	return s.repository.UpdateLastLogin(ctx, userID, time.Now().UTC())
+func (service *AuthService) Logout(ctx context.Context, userID domain.UserID) error {
+	return service.userRespository.UpdateLastLogin(ctx, userID, time.Now().UTC())
 }
 
-func (s *AuthService) CreateApiToken(ctx context.Context, userID domain.UserID, nameStr string, scope domain.KeyScope) (domain.ApiToken, string, error) {
+func (service *AuthService) CreateApiToken(ctx context.Context, userID domain.UserID, nameStr string, scope domain.KeyScope) (domain.ApiToken, string, error) {
 	name, err := domain.NewKeyName(nameStr)
 	if err != nil {
 		return domain.ApiToken{}, "", err
 	}
 
 	rawKey := security.GenerateOpaqueApiToken(domain.ApiTokenPrefix)
-	apiTokenID := domain.ApiTokenId(ids.New().String())
+	apiTokenID := domain.ApiTokenId(identity.MustNew().String())
 
 	apiToken := domain.NewApiToken(
 		apiTokenID,
@@ -262,41 +420,58 @@ func (s *AuthService) CreateApiToken(ctx context.Context, userID domain.UserID, 
 		scope,
 	)
 
-	created, err := s.tokenRepo.Create(ctx, apiToken)
+	created, err := service.tokenRepository.Create(ctx, apiToken)
 	return created, rawKey.Raw, err
 }
 
-func (s *AuthService) VerifyApiToken(ctx context.Context, rawToken string) (*domain.ApiToken, error) {
+func (service *AuthService) VerifyApiToken(ctx context.Context, rawToken string) (*domain.ApiToken, error) {
 	token, err := security.OpaqueApiTokenFrom(rawToken)
 	if err != nil {
 		return nil, err
 	}
 
-	storedToken, err := s.tokenRepo.GetByHash(ctx, token.Hashed)
+	storedToken, err := service.tokenRepository.GetByHash(ctx, token.Hashed)
 	if err != nil || storedToken == nil {
-		return nil, domain.NewNotFoundError("API token not found")
+		return nil, errors.NotFound("API token not found").Cause(err)
 	}
 
 	if storedToken.IsRevoked() || storedToken.IsExpired() {
-		return nil, domain.NewUnauthorizedError("Expired or revoked token")
+		return nil, errors.Unauthorized("Expired or revoked token").Cause(err)
 	}
 
 	return storedToken, nil
 }
 
-func (s *AuthService) RevokeApiToken(ctx context.Context, userID domain.UserID, apiTokenID string) error {
-	token, err := s.tokenRepo.GetByID(ctx, domain.ApiTokenId(apiTokenID))
+func (service *AuthService) RevokeApiToken(ctx context.Context, userID domain.UserID, apiTokenID string) error {
+	token, err := service.tokenRepository.GetByID(ctx, domain.ApiTokenId(apiTokenID))
 	if err != nil || token == nil {
-		return domain.NewNotFoundError("API token not found")
+		return errors.NotFound("API token not found").Cause(err)
 	}
 
 	if token.UserID != userID.String() {
-		return domain.NewForbiddenError()
+		return errors.Forbidden("You are not the owner of this token")
 	}
 
-	return s.tokenRepo.Revoke(ctx, domain.ApiTokenId(apiTokenID))
+	return service.tokenRepository.Revoke(ctx, domain.ApiTokenId(apiTokenID))
 }
 
-func (s *AuthService) MarkApiTokenAsUsed(ctx context.Context, apiTokenID string) error {
-	return s.tokenRepo.UpdateLastUsed(ctx, domain.ApiTokenId(apiTokenID))
+func (service *AuthService) ListApiTokens(ctx context.Context, userID domain.UserID) ([]domain.ApiToken, error) {
+	return service.tokenRepository.ListByUser(ctx, userID.String())
+}
+
+func (service *AuthService) DeleteApiToken(ctx context.Context, userID domain.UserID, apiTokenID string) error {
+	token, err := service.tokenRepository.GetByID(ctx, domain.ApiTokenId(apiTokenID))
+	if err != nil || token == nil {
+		return errors.NotFound("API token not found").Cause(err)
+	}
+
+	if token.UserID != userID.String() {
+		return errors.Forbidden("You are not the owner of this token")
+	}
+
+	return service.tokenRepository.Delete(ctx, domain.ApiTokenId(apiTokenID))
+}
+
+func (service *AuthService) MarkApiTokenAsUsed(ctx context.Context, apiTokenID string) error {
+	return service.tokenRepository.UpdateLastUsed(ctx, domain.ApiTokenId(apiTokenID))
 }

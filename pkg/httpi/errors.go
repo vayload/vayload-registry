@@ -1,14 +1,12 @@
 package httpi
 
 import (
-	"errors"
+	"fmt"
 	"net/http"
-	"strings"
 
-	"github.com/go-playground/validator/v10"
 	"github.com/gofiber/fiber/v2"
+	"github.com/vayload/plug-registry/internal/shared/errors"
 	"github.com/vayload/plug-registry/pkg/logger"
-	"github.com/vayload/plug-registry/pkg/utils"
 )
 
 type LogLevel int
@@ -24,33 +22,6 @@ const (
 
 // Default log level - can be changed at runtime
 var ErrorHandlerLogLevel = LogLevelDebug
-
-var validate = validator.New()
-
-func Validate(s any) error {
-	if err := validate.Struct(s); err != nil {
-		if _, ok := err.(*validator.InvalidValidationError); ok {
-			return ErrInternal(err)
-		}
-		return ErrValidation(err)
-	}
-	return nil
-}
-
-func init() {
-	if err := validate.RegisterValidation("email-or-phone", func(fl validator.FieldLevel) bool {
-		email := fl.Field().String()
-		// If given value is email-like (contains "@" and "."), validate as email
-		if strings.ContainsAny(email, "@.") {
-			return utils.IsValidEmail(email)
-		}
-
-		// Otherwise, validate as phone
-		return utils.IsValidPhone(email)
-	}); err != nil {
-		logger.F(err, logger.Fields{"context": "init", "action": "register custom validation"})
-	}
-}
 
 type StatusText string
 
@@ -192,8 +163,62 @@ func HandleException(cause error, details ...any) *Err {
 	return ErrWrapping(cause, details...)
 }
 
-func MapFromAppException(cause error, details ...any) *Err {
-	return ErrWrapping(cause, details...)
+func MappingErrToHttp(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	// Use type switch for direct type checking (not recursive like errors.As)
+	// This prevents matching errors nested in Cause
+	switch e := err.(type) {
+	case *errors.ErrBuilder:
+		return mapErrToHttp(e.Err)
+	case *errors.Err:
+		return mapErrToHttp(e)
+	case *HttpClientErr:
+		return &Err{
+			Status: e.Status,
+			Err: HttpError{
+				Code:    e.Code,
+				Message: e.Message,
+			},
+			Cause: e.Cause,
+		}
+	case *Err:
+		return e
+	}
+
+	// Fallback: try errors.As for wrapped errors (but only if direct check failed)
+	var builderErr *errors.ErrBuilder
+	if errors.As(err, &builderErr) {
+		return mapErrToHttp(builderErr.Err)
+	}
+
+	var domainErr *errors.Err
+	if errors.As(err, &domainErr) {
+		return mapErrToHttp(domainErr)
+	}
+
+	return ErrInternal(fmt.Errorf("unexpected error: %w", err))
+}
+
+func mapErrToHttp(domainErr *errors.Err) *Err {
+	httpErr := HttpError{
+		Code:    domainErr.Code,
+		Message: domainErr.Message,
+	}
+	if domainErr.Details != nil {
+		httpErr.Details = domainErr.Details
+	}
+	if domainErr.Reason != "" {
+		httpErr.Reason = domainErr.Reason
+	}
+
+	return &Err{
+		Status: domainErr.StatusCode,
+		Err:    httpErr,
+		Cause:  domainErr.Cause,
+	}
 }
 
 func HttpErrorHandler(req HttpRequest, res HttpResponse, err error) error {
@@ -337,7 +362,7 @@ func shouldLog(statusCode int) bool {
 
 // logByStatus logs using appropriate log level based on status code
 func logByStatus(statusCode int, cause error, fields ...logger.Fields) {
-	// Protección contra nil
+	// Protect against nil
 	if cause == nil {
 		cause = errors.New("unknown error")
 	}

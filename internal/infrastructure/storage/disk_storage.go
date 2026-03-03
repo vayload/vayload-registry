@@ -1,63 +1,69 @@
+//go:build !r2_storage
+// +build !r2_storage
+
 package storage
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/vayload/plug-registry/internal/domain"
 )
 
-type diskStorage struct {
-	basePath string
-	baseURL  string // URL of the API to serve local files
+type LocalStorage struct {
+	BasePath string
+	Secret   []byte
+	BaseURL  string
 }
 
-func NewDiskStorage(basePath, baseURL string) domain.StorageProvider {
-	return &diskStorage{
-		basePath: basePath,
-		baseURL:  baseURL,
-	}
+// NewStorage creates a new instance of LocalStorage.
+func NewStorage(cfg StorageConfig) (*LocalStorage, error) {
+	return &LocalStorage{
+		BasePath: fmt.Sprintf("%s/%s", cfg.BaseLocalPath, cfg.BucketName),
+		Secret:   cfg.LocalHMACSecret,
+		BaseURL:  cfg.LocalEndpoint,
+	}, nil
 }
 
-func (s *diskStorage) GetSignedURL(ctx context.Context, key string) (string, error) {
-	// For local storage, we return a URL pointing to our internal storage handler
-	// In a real app, we might add a temporal JWT token as a query parameter
-	return fmt.Sprintf("%s/storage/get/%s", s.baseURL, key), nil
-}
-
-func (s *diskStorage) Upload(ctx context.Context, name, version string, data io.Reader) (string, int64, string, error) {
-	filename := fmt.Sprintf("%s-%s.tar.gz", name, version)
-	path := filepath.Join(s.basePath, filename)
-
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return "", 0, "", err
-	}
-
-	out, err := os.Create(path)
+func (l *LocalStorage) Put(ctx context.Context, key string, mimeType string, r io.Reader) error {
+	path := filepath.Join(l.BasePath, key)
+	os.MkdirAll(filepath.Dir(path), 0755)
+	f, err := os.Create(path)
 	if err != nil {
-		return "", 0, "", err
+		return err
 	}
-	defer out.Close()
-
-	hasher := sha256.New()
-	multi := io.MultiWriter(out, hasher)
-
-	written, err := io.Copy(multi, data)
-	if err != nil {
-		return "", 0, "", err
-	}
-
-	sha256Hex := fmt.Sprintf("%x", hasher.Sum(nil))
-
-	return filename, written, sha256Hex, nil
+	defer f.Close()
+	_, err = io.Copy(f, r)
+	return err
 }
 
-func (s *diskStorage) Fetch(ctx context.Context, name, version string) (io.ReadCloser, error) {
-	filename := fmt.Sprintf("%s-%s.tar.gz", name, version)
-	path := filepath.Join(s.basePath, filename)
+func (l *LocalStorage) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	path := filepath.Join(l.BasePath, key)
 	return os.Open(path)
 }
+
+func (l *LocalStorage) Delete(ctx context.Context, key string) error {
+	path := filepath.Join(l.BasePath, key)
+	return os.Remove(path)
+}
+
+func (l *LocalStorage) GetSignedURL(ctx context.Context, key string) (string, error) {
+	exp := time.Now().Add(15 * time.Minute).Unix()
+	msg := fmt.Sprintf("%s:%d", key, exp)
+	mac := hmac.New(sha256.New, l.Secret)
+	mac.Write([]byte(msg))
+	sig := base64.URLEncoding.EncodeToString(mac.Sum(nil))
+
+	u := fmt.Sprintf("%s%s?exp=%d&sig=%s", l.BaseURL, url.PathEscape(key), exp, url.QueryEscape(sig))
+	return u, nil
+}
+
+var _ domain.IPluginStorage = (*LocalStorage)(nil)

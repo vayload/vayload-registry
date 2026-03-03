@@ -37,6 +37,7 @@ func E(err error, fields ...Fields) {
 	Get().Error(err, fields...)
 }
 
+// Fatal error and exists
 func F(err error, fields ...Fields) {
 	Get().Fatal(err, fields...)
 }

@@ -6,12 +6,13 @@ import (
 
 	"github.com/vayload/plug-registry/internal/domain"
 	"github.com/vayload/plug-registry/internal/services"
+	"github.com/vayload/plug-registry/internal/shared"
 	"github.com/vayload/plug-registry/internal/shared/container"
 	"github.com/vayload/plug-registry/internal/transport/middleware"
 	"github.com/vayload/plug-registry/pkg/httpi"
+	"github.com/vayload/plug-registry/pkg/optional"
 )
 
-// PluginController handles plugin-related HTTP requests.
 type PluginController struct {
 	pluginService *services.PluginService
 	registry      *container.Container
@@ -24,62 +25,62 @@ func NewPluginController(pluginService *services.PluginService, registry *contai
 	}
 }
 
-func (c *PluginController) Path() string {
-	return "/plugins"
-}
-
-func (c *PluginController) Middlewares() []httpi.HttpHandler {
-	return nil
-}
-
-func (c *PluginController) Routes() []httpi.HttpRoute {
+func (c *PluginController) Routes() *httpi.HttpRoutesGroup {
 	authGuard := middleware.NewAuthGuard(c.registry)
 	publishGuard := middleware.NewPublishGuard(c.registry)
 
-	return []httpi.HttpRoute{
-		{
-			Path:    "/",
-			Method:  httpi.GET,
-			Handler: c.SearchPlugins,
-		},
-		{
-			Path:    "/:name",
-			Method:  httpi.GET,
-			Handler: c.GetPlugin,
-		},
-		{
-			Path:       "/me",
-			Method:     httpi.GET,
-			Handler:    c.ListMyPlugins,
-			Middleware: []httpi.HttpHandler{authGuard},
-		},
-		{
-			Path:       "/publish",
-			Method:     httpi.POST,
-			Handler:    c.PublishPlugin,
-			Middleware: []httpi.HttpHandler{publishGuard},
-		},
-		{
-			Path:    "/:name/download",
-			Method:  httpi.GET,
-			Handler: c.DownloadPlugin,
-		},
-		{
-			Path:       "/:name/:version/status",
-			Method:     httpi.PATCH,
-			Handler:    c.UpdatePluginStatus,
-			Middleware: []httpi.HttpHandler{authGuard},
-		},
-		{
-			Path:       "/:name/:version",
-			Method:     httpi.DELETE,
-			Handler:    c.DeletePlugin,
-			Middleware: []httpi.HttpHandler{authGuard},
-		},
-		{
-			Path:    "/storage/get/:filename",
-			Method:  httpi.GET,
-			Handler: c.ServeStorage,
+	return &httpi.HttpRoutesGroup{
+		Prefix: "/plugins",
+		Routes: []httpi.HttpRoute{
+			{
+				Path:    "/",
+				Method:  httpi.GET,
+				Handler: c.SearchPlugins,
+			},
+			{
+				Path:       "/publish",
+				Method:     httpi.POST,
+				Handler:    c.PublishPlugin,
+				Middleware: []httpi.HttpHandler{publishGuard},
+			},
+			{
+				Path:    "/:name/download",
+				Method:  httpi.GET,
+				Handler: c.DownloadPlugin,
+			},
+			{
+				Path:    "/:name/info",
+				Method:  httpi.GET,
+				Handler: c.GetPluginSummary,
+			},
+			{
+				Path:       "/:name/:version/status",
+				Method:     httpi.PATCH,
+				Handler:    c.UpdatePluginStatus,
+				Middleware: []httpi.HttpHandler{authGuard},
+			},
+			{
+				Path:       "/:name/:version",
+				Method:     httpi.DELETE,
+				Handler:    c.DeletePlugin,
+				Middleware: []httpi.HttpHandler{authGuard},
+			},
+			{
+				Path:    "/storage/get/:filename",
+				Method:  httpi.GET,
+				Handler: c.ServeStorage,
+			},
+			{
+				Path:       "/me",
+				Method:     httpi.GET,
+				Handler:    c.ListMyPlugins,
+				Middleware: []httpi.HttpHandler{authGuard},
+			},
+			{
+				Path:    "/:name",
+				Method:  httpi.GET,
+				Handler: c.GetPlugin,
+			},
 		},
 	}
 }
@@ -107,10 +108,10 @@ func (c *PluginController) SearchPlugins(req httpi.HttpRequest, res httpi.HttpRe
 		Offset: uint32(offset),
 	})
 	if err != nil {
-		return res.Status(500).JSON(map[string]any{"error": err.Error()})
+		return httpi.MappingErrToHttp(err)
 	}
 
-	return res.JSON(plugins)
+	return res.Status(200).Json(httpi.NewResponseBody(plugins))
 }
 
 // GetPlugin godoc
@@ -127,7 +128,27 @@ func (c *PluginController) GetPlugin(req httpi.HttpRequest, res httpi.HttpRespon
 	name := req.GetParam("name")
 	plugin, err := c.pluginService.GetPlugin(req.Context(), name)
 	if err != nil {
-		return httpi.MapFromAppException(err)
+		return httpi.MappingErrToHttp(err)
+	}
+
+	return res.Status(200).Json(httpi.NewResponseBody(plugin))
+}
+
+// GetPlugin godoc
+// @Summary      Get plugin summary info
+// @Description  Get detailed information about a plugin by name
+// @Tags         Plugins
+// @Accept       json
+// @Produce      json
+// @Param        name  path      string  true  "Plugin Name"
+// @Success      200   {object}  domain.Plugin
+// @Failure      404   {object}  httpi.ErrorResponse
+// @Router       /plugins/{name} [get]
+func (c *PluginController) GetPluginSummary(req httpi.HttpRequest, res httpi.HttpResponse) error {
+	name := req.GetParam("name")
+	plugin, err := c.pluginService.GetPluginSummary(req.Context(), name)
+	if err != nil {
+		return httpi.MappingErrToHttp(err)
 	}
 
 	return res.Status(200).Json(httpi.NewResponseBody(plugin))
@@ -160,20 +181,31 @@ func (c *PluginController) PublishPlugin(req httpi.HttpRequest, res httpi.HttpRe
 	if err != nil {
 		return httpi.ErrInternal(nil, "Failed to open file")
 	}
-	defer f.Close()
+	defer func() {
+		if f != nil {
+			f.Close()
+		}
+	}()
 
 	access := req.GetQuery("access")
 	isDraft := req.GetQuery("draft", "false") == "true"
-
-	p, err := c.pluginService.Publish(req.Context(), auth.UserId.String(), f, file.Size, services.PublishOptions{
+	fileInput := &shared.File{
+		Reader:   f,
+		Size:     file.Size,
+		Filename: file.Filename,
+		MimeType: file.Header.Get("Content-Type"),
+	}
+	options := services.PublishOptions{
 		Access:  access,
 		IsDraft: isDraft,
-	})
-	if err != nil {
-		return httpi.ErrBadRequest(nil, err.Error())
 	}
 
-	return res.Status(201).Json(p)
+	plugin, err := c.pluginService.Publish(req.Context(), auth.UserId, fileInput, options, &auth.Scope)
+	if err != nil {
+		return httpi.MappingErrToHttp(err)
+	}
+
+	return res.Status(201).Json(httpi.NewResponseBody(plugin))
 }
 
 // DownloadPlugin godoc
@@ -187,18 +219,14 @@ func (c *PluginController) PublishPlugin(req httpi.HttpRequest, res httpi.HttpRe
 // @Router       /plugins/{name}/download [get]
 func (c *PluginController) DownloadPlugin(req httpi.HttpRequest, res httpi.HttpResponse) error {
 	name := req.GetParam("name")
-	version := req.GetQuery("version")
-	var v *string
-	if version != "" {
-		v = &version
-	}
+	version := optional.Of(req.GetQuery("version")).Ptr()
 
-	url, err := c.pluginService.GetDownloadURL(req.Context(), name, v)
+	meta, err := c.pluginService.GetDownloadURL(req.Context(), name, version)
 	if err != nil {
-		return httpi.ErrNotFound(nil, err.Error())
+		return httpi.MappingErrToHttp(err)
 	}
 
-	return res.Redirect(url, 302)
+	return res.Status(200).Json(httpi.NewResponseBody(meta))
 }
 
 // ListMyPlugins godoc
@@ -215,17 +243,15 @@ func (c *PluginController) DownloadPlugin(req httpi.HttpRequest, res httpi.HttpR
 func (c *PluginController) ListMyPlugins(req httpi.HttpRequest, res httpi.HttpResponse) error {
 	auth := req.Auth()
 	if auth == nil || auth.UserId.IsZero() {
-		return res.Status(401).JSON(map[string]any{"error": "Unauthorized"})
+		return httpi.ErrUnauthorized(nil, "Unauthorized")
 	}
 
-	userID := auth.UserId.String()
-	plugins, err := c.pluginService.Search(req.Context(), domain.PluginFilter{
-		OwnerId: &userID,
-	})
+	plugins, err := c.pluginService.SearchByOwnerId(req.Context(), auth.UserId)
 	if err != nil {
-		return res.Status(500).JSON(map[string]any{"error": err.Error()})
+		return httpi.MappingErrToHttp(err)
 	}
-	return res.JSON(plugins)
+
+	return res.Status(200).Json(httpi.NewResponseBody(NewPagination(plugins, 1, 10, len(plugins))))
 }
 
 // UpdatePluginStatus godoc
@@ -260,10 +286,10 @@ func (c *PluginController) UpdatePluginStatus(req httpi.HttpRequest, res httpi.H
 
 	err = c.pluginService.UpdateStatus(req.Context(), auth.UserId.String(), name, version, body.Status)
 	if err != nil {
-		return httpi.ErrBadRequest(nil, err.Error())
+		return httpi.MappingErrToHttp(err)
 	}
 
-	return res.JSON(map[string]string{"message": "Status updated"})
+	return res.Status(200).Json(httpi.NewResponseBody(map[string]string{"message": "Status updated"}))
 }
 
 // DeletePlugin godoc
@@ -289,7 +315,7 @@ func (c *PluginController) DeletePlugin(req httpi.HttpRequest, res httpi.HttpRes
 
 	err = c.pluginService.DeleteVersion(req.Context(), auth.UserId.String(), name, version)
 	if err != nil {
-		return httpi.ErrBadRequest(nil, err.Error())
+		return httpi.MappingErrToHttp(err)
 	}
 
 	return res.Status(204).JSON(nil)
@@ -322,4 +348,22 @@ func (c *PluginController) ServeStorage(req httpi.HttpRequest, res httpi.HttpRes
 	res.SetHeader("Content-Type", "application/gzip")
 	res.SetHeader("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
 	return res.Stream(reader)
+}
+
+type Pagination[T any] struct {
+	Data       []T `json:"data"`
+	Page       int `json:"page"`
+	Limit      int `json:"limit"`
+	Total      int `json:"total"`
+	TotalPages int `json:"total_pages"`
+}
+
+func NewPagination[T any](data []T, page, limit, total int) *Pagination[T] {
+	return &Pagination[T]{
+		Data:       data,
+		Page:       page,
+		Limit:      limit,
+		Total:      total,
+		TotalPages: (total + limit - 1) / limit,
+	}
 }

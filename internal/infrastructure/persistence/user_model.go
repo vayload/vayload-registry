@@ -2,27 +2,29 @@ package persistence
 
 import (
 	"database/sql"
-	"time"
 
 	"github.com/vayload/plug-registry/internal/domain"
-	"github.com/vayload/plug-registry/internal/shared/entity"
+	"github.com/vayload/plug-registry/internal/shared"
+	"github.com/vayload/plug-registry/internal/shared/identity"
 	"github.com/vayload/plug-registry/pkg/operator"
 )
 
 type UserModel struct {
-	ID           entity.ID      `db:"id"`
-	Username     string         `db:"username"`
-	Email        string         `db:"email"`
-	PasswordHash sql.NullString `db:"password_hash"`
-	AvatarURL    sql.NullString `db:"avatar_url"`
-	Provider     string         `db:"provider"`
-	ProviderID   string         `db:"provider_id"`
-	IsActive     int            `db:"is_active"`
-	Role         string         `db:"role"`
-	VerifiedAt   *time.Time     `db:"verified_at"`
-	CreatedAt    time.Time      `db:"created_at"`
-	UpdatedAt    time.Time      `db:"updated_at"`
-	LastLoginAt  *time.Time     `db:"last_login_at"`
+	ID            identity.ID         `db:"id"`
+	Username      string              `db:"username"`
+	Email         string              `db:"email"`
+	PasswordHash  sql.NullString      `db:"password_hash"`
+	VefifyToken   sql.NullString      `db:"verification_token"`
+	AvatarURL     sql.NullString      `db:"avatar_url"`
+	Provider      string              `db:"provider"`
+	ProviderID    string              `db:"provider_id"`
+	IsActive      int                 `db:"is_active"`
+	Role          string              `db:"role"`
+	EmailVerified int                 `db:"email_verified"`
+	VerifiedAt    shared.NullUnixTime `db:"verified_at"`
+	CreatedAt     shared.UnixTime     `db:"created_at"`
+	UpdatedAt     shared.UnixTime     `db:"updated_at"`
+	LastLoginAt   shared.NullUnixTime `db:"last_login_at"`
 }
 
 func NewUserModel(user *domain.User) *UserModel {
@@ -41,20 +43,25 @@ func NewUserModel(user *domain.User) *UserModel {
 	}
 
 	return &UserModel{
-		ID:           user.ID.Unwrap(),
-		Username:     user.Username.String(),
-		Email:        user.Email.String(),
-		PasswordHash: sql.NullString{String: pwdHash, Valid: pwdHashValid},
-		AvatarURL:    sql.NullString{String: avatarURL, Valid: avatarURLValid},
-		Provider:     user.Provider.String(),
-		ProviderID:   user.ProviderID,
-		IsActive:     operator.When(user.IsActive, 1, 0),
-		Role:         user.Role.String(),
-		VerifiedAt:   user.VerifiedAt,
-		CreatedAt:    user.CreatedAt,
-		UpdatedAt:    user.UpdatedAt,
-		LastLoginAt:  user.LastLoginAt,
+		ID:            user.ID.Unwrap(),
+		Username:      user.Username.String(),
+		Email:         user.Email.String(),
+		PasswordHash:  sql.NullString{String: pwdHash, Valid: pwdHashValid},
+		AvatarURL:     sql.NullString{String: avatarURL, Valid: avatarURLValid},
+		Provider:      user.Provider.String(),
+		ProviderID:    user.ProviderID,
+		IsActive:      operator.When(user.IsActive, 1, 0),
+		Role:          user.Role.String(),
+		EmailVerified: operator.When(user.EmailVerified, 1, 0),
+		VerifiedAt:    shared.NewNullUnixTime(user.VerifiedAt),
+		CreatedAt:     shared.UnixTime(user.CreatedAt),
+		UpdatedAt:     shared.UnixTime(user.UpdatedAt),
+		LastLoginAt:   shared.NewNullUnixTime(user.LastLoginAt),
 	}
+}
+
+func (m *UserModel) SetUnverifiedToken(token string) {
+	m.VefifyToken = sql.NullString{String: token, Valid: true}
 }
 
 func (m *UserModel) MapToDomain() *domain.User {
@@ -69,63 +76,120 @@ func (m *UserModel) MapToDomain() *domain.User {
 	}
 
 	return &domain.User{
-		ID:           domain.UserID{ID: m.ID},
-		Username:     domain.Username(m.Username),
-		Email:        domain.Email(m.Email),
-		PasswordHash: pwdHash,
-		AvatarURL:    avatarURL,
-		Provider:     domain.AuthProvider(m.Provider),
-		ProviderID:   m.ProviderID,
-		VerifiedAt:   m.VerifiedAt,
-		CreatedAt:    m.CreatedAt,
-		UpdatedAt:    m.UpdatedAt,
-		LastLoginAt:  m.LastLoginAt,
-		IsActive:     m.IsActive == 1,
-		Role:         domain.UserRole(m.Role), // is safe, because in database store only allowed values
+		ID:            domain.UserID{ID: m.ID},
+		Username:      domain.Username(m.Username),
+		Email:         domain.Email(m.Email),
+		PasswordHash:  pwdHash,
+		AvatarURL:     avatarURL,
+		Provider:      domain.AuthProvider(m.Provider),
+		ProviderID:    m.ProviderID,
+		VerifiedAt:    m.VerifiedAt.Ptr(),
+		CreatedAt:     m.CreatedAt.Time(),
+		UpdatedAt:     m.UpdatedAt.Time(),
+		LastLoginAt:   m.LastLoginAt.Ptr(),
+		IsActive:      m.IsActive == 1,
+		EmailVerified: m.EmailVerified == 1,
+		Role:          domain.UserRole(m.Role), // is safe, because in database store only allowed values
 	}
 }
 
 type RefreshTokenModel struct {
-	ID            string         `db:"id"`
-	UserID        string         `db:"user_id"`
-	TokenHash     string         `db:"token_hash"`
-	ExpiresAt     *time.Time     `db:"expires_at"`
-	CreatedAt     time.Time      `db:"created_at"`
-	RevokedAt     *time.Time     `db:"revoked_at"`
-	RevokedReason sql.NullString `db:"revoked_reason"`
+	ID            string              `db:"id"`
+	UserID        string              `db:"user_id"`
+	TokenHash     string              `db:"token_hash"`
+	FamilyID      string              `db:"family_id"`
+	ParentID      sql.NullString      `db:"parent_id"`
+	UsedAt        shared.NullUnixTime `db:"used_at"`
+	RevokedAt     shared.NullUnixTime `db:"revoked_at"`
+	RevokedReason sql.NullString      `db:"revoked_reason"`
+	ExpiresAt     shared.UnixTime     `db:"expires_at"`
+	CreatedAt     shared.UnixTime     `db:"created_at"`
+	UserAgent     sql.NullString      `db:"user_agent"`
+	IPAddress     sql.NullString      `db:"ip_address"`
 }
 
 func NewRefreshTokenModel(token *domain.RefreshToken) *RefreshTokenModel {
-	var reason string
-	var reasonValid bool
+	var parentID sql.NullString
+	if token.ParentID != nil {
+		parentID = sql.NullString{
+			String: *token.ParentID,
+			Valid:  true,
+		}
+	}
+
+	var revokedReason sql.NullString
 	if token.RevokedReason != nil {
-		reason = *token.RevokedReason
-		reasonValid = true
+		revokedReason = sql.NullString{
+			String: *token.RevokedReason,
+			Valid:  true,
+		}
+	}
+
+	var userAgent sql.NullString
+	if token.UserAgent != nil {
+		userAgent = sql.NullString{
+			String: *token.UserAgent,
+			Valid:  true,
+		}
+	}
+
+	var ipAddress sql.NullString
+	if token.IPAddress != nil {
+		ipAddress = sql.NullString{
+			String: *token.IPAddress,
+			Valid:  true,
+		}
 	}
 
 	return &RefreshTokenModel{
 		ID:            token.ID,
 		UserID:        token.UserID,
 		TokenHash:     token.TokenHash,
-		ExpiresAt:     token.ExpiresAt,
-		CreatedAt:     token.CreatedAt,
-		RevokedAt:     token.RevokedAt,
-		RevokedReason: sql.NullString{String: reason, Valid: reasonValid},
+		FamilyID:      token.FamilyID,
+		ParentID:      parentID,
+		UsedAt:        shared.NewNullUnixTime(token.UsedAt),
+		RevokedAt:     shared.NewNullUnixTime(token.RevokedAt),
+		RevokedReason: revokedReason,
+		ExpiresAt:     shared.UnixTime(token.ExpiresAt),
+		CreatedAt:     shared.UnixTime(token.CreatedAt),
+		UserAgent:     userAgent,
+		IPAddress:     ipAddress,
 	}
 }
 
 func (m *RefreshTokenModel) MapToDomain() *domain.RefreshToken {
-	var reason *string
-	if m.RevokedReason.Valid {
-		reason = &m.RevokedReason.String
+	var parentID *string
+	if m.ParentID.Valid {
+		parentID = &m.ParentID.String
 	}
+
+	var revokedReason *string
+	if m.RevokedReason.Valid {
+		revokedReason = &m.RevokedReason.String
+	}
+
+	var userAgent *string
+	if m.UserAgent.Valid {
+		userAgent = &m.UserAgent.String
+	}
+
+	var ipAddress *string
+	if m.IPAddress.Valid {
+		ipAddress = &m.IPAddress.String
+	}
+
 	return &domain.RefreshToken{
 		ID:            m.ID,
 		UserID:        m.UserID,
 		TokenHash:     m.TokenHash,
-		ExpiresAt:     m.ExpiresAt,
-		CreatedAt:     m.CreatedAt,
-		RevokedAt:     m.RevokedAt,
-		RevokedReason: reason,
+		FamilyID:      m.FamilyID,
+		ParentID:      parentID,
+		UsedAt:        m.UsedAt.Ptr(),
+		RevokedAt:     m.RevokedAt.Ptr(),
+		RevokedReason: revokedReason,
+		ExpiresAt:     m.ExpiresAt.Time(),
+		CreatedAt:     m.CreatedAt.Time(),
+		UserAgent:     userAgent,
+		IPAddress:     ipAddress,
 	}
 }

@@ -1,11 +1,3 @@
-/*
- * SPDX-License-Identifier: MIT
- *
- * Vayload - Container
- *
- * Copyright (c) 2026 Alex Zweiter
- */
-
 package security
 
 import (
@@ -27,6 +19,8 @@ const (
 	HashBlockSize   = 8
 	HashParallelism = 1
 )
+
+const JWT_SERVICE_NAME = "jwt_manager"
 
 type scryptHasher struct{}
 
