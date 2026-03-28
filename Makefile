@@ -23,6 +23,16 @@ build:
 	-o $(BUILD_DIR)/$(APP_NAME) -v \
 	$(CMD_PATH)
 
+
+build-turso:
+	@echo "Building $(APP_NAME) for $(GOOS)/$(GOARCH)"
+	GOOS=$(GOOS) GOARCH=$(GOARCH) GOAMD64=$(GOAMD64) \
+	go build $(GOFLAGS) \
+	-tags="r2_storage turso" \
+	-ldflags "$(LDFLAGS)" \
+	-o $(BUILD_DIR)/$(APP_NAME) -v \
+	$(CMD_PATH)
+
 # Build with redis cache
 build-redis:
 	@echo "Building with Redis"
