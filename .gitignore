@@ -65,4 +65,3 @@ test-results/
 # Used for testing
 examples/
 tmp/
-main.go
