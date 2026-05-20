@@ -131,12 +131,10 @@ func (p *elasticPool) maybeScaleUp() {
 
 func (p *elasticPool) spawnWorker(temporary bool) {
 	p.activeWorkers.Add(1)
-	p.wg.Add(1)
-	go func() {
-		defer p.wg.Done()
+	p.wg.Go(func() {
 		defer p.activeWorkers.Add(-1)
 		p.runWorker(temporary)
-	}()
+	})
 }
 
 func (p *elasticPool) runWorker(temporary bool) {
